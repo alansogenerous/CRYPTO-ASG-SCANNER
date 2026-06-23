@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from enum import Enum
 
 # ==========================================
@@ -93,7 +93,7 @@ def fetch_yfinance_data(ticker: str, interval: str, lookback_days: int) -> pd.Da
         if isinstance(last_candle_time, pd.Timestamp):
             time_diff = datetime.now(last_candle_time.tzinfo) - last_candle_time
             if time_diff.total_seconds() > 172800:  # 48 hours
-                print(f"️ WARNING: Data for {ticker} seems stale. Last candle: {last_candle_time}. Skipping.")
+                print(f"⚠️ WARNING: Data for {ticker} seems stale. Last candle: {last_candle_time}. Skipping.")
                 return pd.DataFrame()
         
         # QC 2: Check for price anomalies (e.g., ETH $4400 when market is $1600)
@@ -134,12 +134,14 @@ class BBMABuyTracker:
         self.extreme_low = None
         self.mhv_confirmed = False
         self.csa_confirmed = False
+        self.setup_timestamp = None
     
     def reset(self):
         self.state = BBMAState.NONE
         self.extreme_low = None
         self.mhv_confirmed = False
         self.csa_confirmed = False
+        self.setup_timestamp = None
     
     def update(self, row: pd.Series, prev_row: pd.Series) -> Optional[Dict]:
         close = row['Close']
@@ -171,6 +173,7 @@ class BBMABuyTracker:
             self.extreme_low = low
             self.mhv_confirmed = False
             self.csa_confirmed = False
+            self.setup_timestamp = None
             return None
         
         # --- 2. CHECK MHV AFTER EXTREME BUY ---
@@ -226,8 +229,11 @@ class BBMABuyTracker:
             
             if valid_reentry:
                 self.state = BBMAState.REENTRY_BUY
+                self.setup_timestamp = datetime.now()
                 return {
                     'type': 'BUY',
+                    'trigger_price': close,
+                    'trigger_time': datetime.now().isoformat(),
                     'ma5_low': ma5_low,
                     'ma10_low': ma10_low,
                     'bb_lower': bb_lower,
@@ -240,24 +246,69 @@ class BBMABuyTracker:
         return None
 
 # ==========================================
-# LEVEL CALCULATION
+# LEVEL CALCULATION (BBMA OMA ALLY COMPLIANT)
 # ==========================================
-def calculate_levels_buy(setup: Dict) -> Dict:
-    entry_aggressive = setup['ma5_low']
-    entry_conservative = setup['ma10_low']
-    entry_moderate = (entry_aggressive + entry_conservative) / 2
+def calculate_levels_buy(setup: Dict, current_price: float, df_small: pd.DataFrame) -> Optional[Dict]:
+    """
+    BBMA Oma Ally Entry Rules:
+    - Entry zone: antara MA5 Low dan MA10 Low (current values, bukan historical)
+    - Entry: current_price jika masih dalam zone
+    - Jika current_price dah drift >3% dari zone, setup expired
+    """
+    # Get CURRENT MA values (bukan dari setup['ma5_low'] lama)
+    current_ma5_low = df_small['ma5_low'].iloc[-1]
+    current_ma10_low = df_small['ma10_low'].iloc[-1]
+    current_ma5_high = df_small['ma5_high'].iloc[-1]
+    current_ma10_high = df_small['ma10_high'].iloc[-1]
+    current_bb_lower = df_small['bb_lower'].iloc[-1]
+    current_bb_upper = df_small['bb_upper'].iloc[-1]
+    current_bb_mid = df_small['bb_mid'].iloc[-1]
     
-    sl = setup['bb_lower']
+    # Define zone: MA5 Low (aggressive) ke MA10 Low (conservative)
+    zone_top = max(current_ma5_low, current_ma10_low)
+    zone_bottom = min(current_ma5_low, current_ma10_low)
     
-    tp1 = setup['ma5_high']
-    tp2 = setup['bb_upper']
-    tp3 = setup['bb_upper'] * 1.02
+    # Check if current price is within re-entry zone (±1% buffer)
+    in_zone = (zone_bottom * 0.99 <= current_price <= zone_top * 1.01)
+    
+    # Check if price drifted too far (>3% from zone)
+    zone_center = (zone_top + zone_bottom) / 2
+    drift_pct = abs(current_price - zone_center) / zone_center
+    
+    if drift_pct > 0.03:
+        # Price drifted too far - setup expired
+        print(f"⚠️ Setup EXPIRED: Price drifted {drift_pct:.1%} from zone")
+        return None
+    
+    # Entry levels
+    if in_zone:
+        # Current price IS the entry (best practice)
+        entry_aggressive = current_price
+        entry_conservative = current_price
+        entry_moderate = current_price
+    else:
+        # Price near zone but not in zone - use zone boundaries
+        entry_aggressive = zone_bottom
+        entry_conservative = zone_top
+        entry_moderate = zone_center
+    
+    # SL: Below BB Lower or below zone with buffer
+    sl = min(current_bb_lower, zone_bottom * 0.985)
+    
+    # TP: MA5/10 High, Mid BB, BB Upper (BBMA rules)
+    tp1 = current_ma5_high
+    tp2 = current_bb_mid
+    tp3 = current_bb_upper
     
     return {
         'conservative': {'entry': entry_conservative, 'sl': sl},
         'moderate': {'entry': entry_moderate, 'sl': sl},
         'aggressive': {'entry': entry_aggressive, 'sl': sl},
-        'tp1': tp1, 'tp2': tp2, 'tp3': tp3
+        'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
+        'zone_top': zone_top,
+        'zone_bottom': zone_bottom,
+        'in_zone': in_zone,
+        'drift_pct': drift_pct
     }
 
 # ==========================================
@@ -278,9 +329,11 @@ def scan_pair(ticker: str):
                 continue
                 
             last_big = df_big.iloc[-1]
+            # FIX: EMA50 below mid BB = Uptrend (BBMA rule)
             uptrend = last_big['ema50'] < last_big['bb_mid']
             
             if not uptrend:
+                print(f"⏭️ {ticker} ({style}): Not uptrend, skipping")
                 continue
             
             df_small = fetch_yfinance_data(ticker, tfs['small'], tfs['lookback_days'])
@@ -293,29 +346,48 @@ def scan_pair(ticker: str):
             tracker.reset()
             
             setup_found = None
+            setup_idx = None
             for i in range(1, len(df_small)):
                 result = tracker.update(df_small.iloc[i], df_small.iloc[i-1])
                 if result is not None:
                     setup_found = result
+                    setup_idx = i
                     break
             
             if setup_found is None:
+                print(f"⏭️ {ticker} ({style}): No setup found")
                 continue
             
-            levels = calculate_levels_buy(setup_found)
-            pair_name = ticker.replace('-USD', '/USDT')
+            # CRITICAL: Check if setup is still valid with current price
             current_price = df_small.iloc[-1]['Close']
+            
+            # Calculate levels using CURRENT data
+            levels = calculate_levels_buy(setup_found, current_price, df_small)
+            
+            if levels is None:
+                print(f"⚠️ {ticker} ({style}): Setup expired, price drifted too far")
+                continue
+            
+            pair_name = ticker.replace('-USD', '/USDT')
+            
+            # Format message
+            zone_info = "✅ IN ZONE" if levels['in_zone'] else "⚠️ NEAR ZONE"
             
             msg = f"""
 🟢 <b>BBMA BUY SETUP DETECTED</b>
 
- Pair: {pair_name}
+📊 Pair: {pair_name}
 💰 Current Price: ${current_price:.2f}
 ⏱️ Style: {style}
 📈 Pattern: Bullish Re-Entry (After CSA)
 ✅ Cycle: Extreme → MHV → CSA → Re-Entry CONFIRMED
+🎯 Zone Status: {zone_info} (Drift: {levels['drift_pct']:.2%})
 
 ━━━━━━━━━━━━━━━━━━━━
+
+📐 <b>ENTRY ZONE</b>
+• Zone Top (Conservative): {levels['zone_top']:.2f}
+• Zone Bottom (Aggressive): {levels['zone_bottom']:.2f}
 
 🟢 <b>CONSERVATIVE ENTRY</b>
 • Entry: {levels['conservative']['entry']:.2f}
@@ -337,7 +409,7 @@ def scan_pair(ticker: str):
 ⚠️ <i>Verify live price on exchange. Setup based on data from {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>
             """
             send_telegram(msg)
-            print(f"🚨 BUY SETUP FOUND: {ticker} ({style}) @ ${current_price:.2f}")
+            print(f"🚨 BUY SETUP FOUND: {ticker} ({style}) @ ${current_price:.2f} | Zone: {levels['zone_bottom']:.2f}-{levels['zone_top']:.2f}")
                 
         except Exception as e:
             print(f"❌ Error {ticker} {style}: {e}")
@@ -356,4 +428,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
