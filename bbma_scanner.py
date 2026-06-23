@@ -16,12 +16,11 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Missing Telegram credentials in GitHub Secrets!")
 
-# Pairs for Crypto (YFinance Tickers)
 PAIRS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD', 'XRP-USD']
 
 STYLES = {
-    'Intraday': {'big': '4h', 'small': '1h', 'lookback_days': 60}, # Lookback 60 days cukup untuk 300 candles 4h
-    'Swing': {'big': '1d', 'small': '4h', 'lookback_days': 365}   # Lookback 1 year untuk daily
+    'Intraday': {'big': '4h', 'small': '1h', 'lookback_days': 60},
+    'Swing': {'big': '1d', 'small': '4h', 'lookback_days': 365}
 }
 
 BB_PERIOD = 20
@@ -46,9 +45,7 @@ def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
 def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    # Standardize column names just in case
     if 'Close' not in df.columns:
-        # Try to find close price column
         close_col = [c for c in df.columns if 'close' in c.lower()]
         if close_col:
             df['Close'] = df[close_col[0]]
@@ -56,7 +53,7 @@ def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
             df['High'] = df[[c for c in df.columns if 'high' in c.lower()][0]]
             df['Low'] = df[[c for c in df.columns if 'low' in c.lower()][0]]
         else:
-            return pd.DataFrame() # Cannot proceed without OHLC
+            return pd.DataFrame()
 
     df['bb_mid'] = df['Close'].rolling(BB_PERIOD).mean()
     bb_std = df['Close'].rolling(BB_PERIOD).std()
@@ -73,50 +70,38 @@ def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 # ==========================================
-# DATA FETCHER WITH VALIDATION (YFINANCE)
+# DATA FETCHER WITH VALIDATION
 # ==========================================
 def fetch_yfinance_data(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame:
-    """
-    Fetches data from YFinance with strict validation to ensure 
-    we are getting current 2026 data and not cached/historical glitches.
-    """
     try:
-        # Calculate start date to ensure we get enough data but focus on recent
         end_date = datetime.now()
         start_date = end_date - timedelta(days=lookback_days)
         
-        # Download data
         df = yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
         
         if df.empty:
             print(f"❌ No data for {ticker} ({interval})")
             return pd.DataFrame()
         
-        # Handle MultiIndex columns if present (common in newer yfinance versions)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
             
-        # Rename to standard if needed
         df.rename(columns={'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'}, inplace=True)
         
-        # --- CRITICAL VALIDATION FOR 2026 DATA ---
-        # Check if the last candle's date is within the last 24-48 hours.
-        # If the last candle is older than 2 days, data might be stale/cached incorrectly.
+        # Validation: Check if data is recent
         last_candle_time = df.index[-1]
         if isinstance(last_candle_time, pd.Timestamp):
             time_diff = datetime.now(last_candle_time.tzinfo) - last_candle_time
-            if time_diff.total_seconds() > 172800: # 48 hours
+            if time_diff.total_seconds() > 172800:  # 48 hours
                 print(f"⚠️ WARNING: Data for {ticker} seems stale. Last candle: {last_candle_time}. Skipping.")
                 return pd.DataFrame()
         
-        # Check for obvious price outliers (e.g., ETH at $4000 when it should be ~$1600)
-        # We compare the last close with the median of the last 10 candles to detect sudden jumps
+        # Validation: Check for price anomalies
         recent_median = df['Close'].iloc[-10:].median()
         last_close = df['Close'].iloc[-1]
         
-        # If price deviates more than 20% from recent median, it's likely a glitch or wrong ticker data
         if abs(last_close - recent_median) / recent_median > 0.20:
-            print(f"⚠️ WARNING: Price anomaly detected for {ticker}. Last: {last_close}, Median: {recent_median}. Skipping.")
+            print(f"⚠️ WARNING: Price anomaly for {ticker}. Last: {last_close}, Median: {recent_median}. Skipping.")
             return pd.DataFrame()
 
         return df
@@ -211,9 +196,18 @@ class BBMABuyTracker:
         
         # --- CHECK RE-ENTRY BUY (ONLY AFTER CSA) ---
         if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
-            in_zone = (low <= ma5_low * 1.003) or (low <= ma10_low * 1.003)
+            # FIXED: Price must TOUCH zone but NOT crash far below
+            in_zone = (
+                (low <= ma5_low * 1.01 and low >= ma5_low * 0.97) or 
+                (low <= ma10_low * 1.01 and low >= ma10_low * 0.97)
+            )
+            
+            # Close must recover near zone (bullish rejection)
+            close_near_zone = close >= ma5_low * 0.98
+            
             valid_reentry = (
                 in_zone and
+                close_near_zone and
                 close <= ma5_high and
                 close <= ma10_high and
                 close <= bb_mid and
@@ -266,7 +260,6 @@ def scan_pair(ticker: str):
         print(f"Scanning {ticker} ({style})...")
         
         try:
-            # Fetch Big TF
             df_big = fetch_yfinance_data(ticker, tfs['big'], tfs['lookback_days'])
             if df_big.empty:
                 continue
@@ -278,10 +271,8 @@ def scan_pair(ticker: str):
             uptrend = last_big['ema50'] < last_big['bb_mid']
             
             if not uptrend:
-                # print(f"ℹ️ {ticker} ({style}) - No uptrend on big TF")
                 continue
             
-            # Fetch Small TF
             df_small = fetch_yfinance_data(ticker, tfs['small'], tfs['lookback_days'])
             if df_small.empty:
                 continue
@@ -292,7 +283,6 @@ def scan_pair(ticker: str):
             tracker.reset()
             
             setup_found = None
-            # Walk through candles sequentially
             for i in range(1, len(df_small)):
                 result = tracker.update(df_small.iloc[i], df_small.iloc[i-1])
                 if result is not None:
@@ -304,12 +294,10 @@ def scan_pair(ticker: str):
             
             levels = calculate_levels_buy(setup_found)
             pair_name = ticker.replace('-USD', '/USDT')
-            
-            # Get current live price for verification in message
             current_price = df_small.iloc[-1]['Close']
             
             msg = f"""
- <b>BBMA BUY SETUP DETECTED</b>
+🟢 <b>BBMA BUY SETUP DETECTED</b>
 
 📊 Pair: {pair_name}
 💰 Current Price: ${current_price:.2f}
@@ -329,20 +317,20 @@ def scan_pair(ticker: str):
 • SL: {levels['moderate']['sl']:.2f}
 • TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
 
- <b>AGGRESSIVE ENTRY</b>
+🔴 <b>AGGRESSIVE ENTRY</b>
 • Entry: {levels['aggressive']['entry']:.2f}
 • SL: {levels['aggressive']['sl']:.2f}
 • TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
 
 ━━━━━━━━━━━━━━━━━━━━
 
-️ <i>Verify live price on exchange. Setup based on data from {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>
+⚠️ <i>Verify live price on exchange. Setup based on data from {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>
             """
             send_telegram(msg)
             print(f"🚨 BUY SETUP FOUND: {ticker} ({style}) @ ${current_price:.2f}")
                 
         except Exception as e:
-            print(f" Error {ticker} {style}: {e}")
+            print(f"❌ Error {ticker} {style}: {e}")
 
 # ==========================================
 # MAIN
