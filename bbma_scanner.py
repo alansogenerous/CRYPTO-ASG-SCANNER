@@ -7,18 +7,18 @@ from datetime import datetime
 from typing import Dict, Optional
 
 # ==========================================
-# CONFIGURATION (Read from GitHub Secrets)
+# CONFIGURATION (Read from GitHub Secrets / Env Vars)
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("Missing Telegram credentials in GitHub Secrets!")
+    raise ValueError("Missing Telegram credentials in Environment Variables!")
 
 PAIRS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD', 'XRP-USD', 'RENDER-USD']
 
+# ONLY INTRADAY & SWING (Scalping removed)
 STYLES = {
-    'Scalping': {'big': '1h', 'small': '15m', 'period_big': '30d', 'period_small': '60d'},
     'Intraday': {'big': '4h', 'small': '1h', 'period_big': '300d', 'period_small': '300d'},
     'Swing': {'big': '1d', 'small': '4h', 'period_big': '730d', 'period_small': '730d'}
 }
@@ -27,7 +27,7 @@ BB_PERIOD = 20
 BB_STD = 2.0
 
 # ==========================================
-# INDICATOR CALCULATIONS
+# INDICATOR CALCULATIONS (Strict BBMA PDF)
 # ==========================================
 def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
     weights = np.arange(1, period + 1)
@@ -62,14 +62,15 @@ def send_telegram(message: str):
         if resp.status_code == 200:
             print(f"✅ Alert sent")
         else:
-            print(f" TG Error: {resp.text}")
+            print(f"❌ TG Error: {resp.text}")
     except Exception as e:
-        print(f"❌ Failed: {e}")
+        print(f" Failed: {e}")
 
 # ==========================================
 # BBMA SCANNER LOGIC
 # ==========================================
 def check_uptrend(df: pd.DataFrame) -> bool:
+    # PDF Spec: EMA 50 below mid BB = Uptrend
     last = df.iloc[-1]
     return last['ema50'] < last['bb_mid']
 
@@ -80,11 +81,14 @@ def find_reentry_buy(df: pd.DataFrame) -> Optional[Dict]:
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     
+    # Zone: Low touched MA5 Low or MA10 Low (0.3% buffer for yfinance noise)
     touch_zone = (curr['Low'] <= curr['ma5_low'] * 1.003) or \
                  (curr['Low'] <= curr['ma10_low'] * 1.003)
     
+    # Validity: Close >= Low BB (Strict PDF rule: "CS tidak boleh CLOSE di luar BB")
     valid_close = curr['Close'] >= curr['bb_lower']
     
+    # Trigger: Reverse Candle (Hijau selepas Merah)
     is_bullish = curr['Close'] > curr['Open']
     prev_bearish = prev['Close'] < prev['Open']
     reverse = is_bullish and prev_bearish
@@ -102,18 +106,21 @@ def find_reentry_buy(df: pd.DataFrame) -> Optional[Dict]:
     return None
 
 def calculate_levels(setup: Dict) -> Dict:
-    entry_high_risk = setup['ma5_low']
-    entry_mid_risk = (setup['ma5_low'] + setup['ma10_low']) / 2
-    entry_low_risk = setup['ma10_low']
+    # 3 Entry Prices based on zone depth
+    entry_high_risk = setup['ma5_low']  # Aggressive
+    entry_mid_risk = (setup['ma5_low'] + setup['ma10_low']) / 2  # Moderate
+    entry_low_risk = setup['ma10_low']  # Conservative
     
+    # SL: Strict BBMA Rule - Must be below Low BB
     sl_base = setup['bb_lower']
     sl_high_risk = sl_base * 0.999
     sl_mid_risk = sl_base * 0.998
     sl_low_risk = sl_base * 0.997
     
-    tp1 = setup['ma5_high']
-    tp2 = setup['bb_upper']
-    tp3 = setup['bb_upper'] * 1.02
+    # TPs
+    tp1 = setup['ma5_high']  # TP1: MA5 High
+    tp2 = setup['bb_upper']  # TP2: Top BB
+    tp3 = setup['bb_upper'] * 1.02  # TP3: Extension
     
     return {
         'high_risk': {'entry': entry_high_risk, 'sl': sl_high_risk},
@@ -150,7 +157,7 @@ def scan_pair(ticker: str):
 
 📊 Pair: {pair_name}
 ⏱️ Style: {style}
-📈 Pattern: Bullish Rejection (Pinbar)
+ Pattern: Bullish Rejection (Pinbar)
 
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -174,7 +181,7 @@ Entry awal, harga terbaik, risiko tinggi
 
 ━━━━━━━━━━━━━━━━━━━━
 
-⚠️ <i>Pilih 1 level je ikut risk appetite kau!</i>
+⚠️ <i>Pilih 1 level je ikut risk appetite kau! Verify live price on exchange.</i>
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
             """
             send_telegram(msg)
