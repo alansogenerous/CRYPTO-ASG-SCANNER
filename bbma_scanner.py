@@ -70,7 +70,7 @@ def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 # ==========================================
-# DATA FETCHER WITH VALIDATION
+# DATA FETCHER WITH 2026 VALIDATION
 # ==========================================
 def fetch_yfinance_data(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame:
     try:
@@ -88,15 +88,15 @@ def fetch_yfinance_data(ticker: str, interval: str, lookback_days: int) -> pd.Da
             
         df.rename(columns={'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'}, inplace=True)
         
-        # Validation: Check if data is recent
+        # QC 1: Check if data is recent (June 2026)
         last_candle_time = df.index[-1]
         if isinstance(last_candle_time, pd.Timestamp):
             time_diff = datetime.now(last_candle_time.tzinfo) - last_candle_time
             if time_diff.total_seconds() > 172800:  # 48 hours
-                print(f"⚠️ WARNING: Data for {ticker} seems stale. Last candle: {last_candle_time}. Skipping.")
+                print(f"️ WARNING: Data for {ticker} seems stale. Last candle: {last_candle_time}. Skipping.")
                 return pd.DataFrame()
         
-        # Validation: Check for price anomalies
+        # QC 2: Check for price anomalies (e.g., ETH $4400 when market is $1600)
         recent_median = df['Close'].iloc[-10:].median()
         last_close = df['Close'].iloc[-1]
         
@@ -126,7 +126,7 @@ def send_telegram(message: str):
         print(f"❌ Failed: {e}")
 
 # ==========================================
-# BBMA STATE MACHINE (BUY ONLY)
+# BBMA STATE MACHINE (STRICT OMA ALLY)
 # ==========================================
 class BBMABuyTracker:
     def __init__(self):
@@ -159,7 +159,8 @@ class BBMABuyTracker:
         prev_bullish = prev_row['Close'] > prev_row['Open']
         prev_bearish = prev_row['Close'] < prev_row['Open']
         
-        # --- CHECK EXTREME BUY ---
+        # --- 1. CHECK EXTREME BUY ---
+        # MA5/10 Low keluar Low BB + Reverse Candle (Bullish after Bearish)
         extreme_buy = (
             (ma5_low < bb_lower or ma10_low < bb_lower) and
             is_bullish and prev_bearish
@@ -172,7 +173,8 @@ class BBMABuyTracker:
             self.csa_confirmed = False
             return None
         
-        # --- CHECK MHV AFTER EXTREME BUY ---
+        # --- 2. CHECK MHV AFTER EXTREME BUY ---
+        # Price tak close bawah Low BB + Reverse Candle (Bearish)
         if self.state == BBMAState.EXTREME_BUY:
             mhv_valid = (close >= bb_lower) and is_bearish and prev_bullish
             
@@ -181,11 +183,13 @@ class BBMABuyTracker:
                 self.mhv_confirmed = True
                 return None
             
+            # MHV batal jika close bawah Low BB (momentum sambung)
             if close < bb_lower:
                 self.reset()
                 return None
         
-        # --- CHECK CSA AFTER MHV ---
+        # --- 3. CHECK CSA AFTER MHV ---
+        # Close atas MA5/10 Low (Early CSA)
         if self.state == BBMAState.MHV_BUY and self.mhv_confirmed:
             csa_early = close > ma5_low and close > ma10_low
             
@@ -194,19 +198,25 @@ class BBMABuyTracker:
                 self.csa_confirmed = True
                 return None
         
-        # --- CHECK RE-ENTRY BUY (ONLY AFTER CSA) ---
+        # --- 4. CHECK RE-ENTRY BUY (ONLY AFTER CSA) ---
+        # CRITICAL QC FIX: Price mesti touch zone, tapi tak boleh crash jauh
         if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
-            # FIXED: Price must TOUCH zone but NOT crash far below
-            in_zone = (
-                (low <= ma5_low * 1.01 and low >= ma5_low * 0.97) or 
-                (low <= ma10_low * 1.01 and low >= ma10_low * 0.97)
+            # Price tak boleh crash lebih 2% bawah MA5/10 zone
+            price_not_crashed = (close >= ma5_low * 0.98 and close >= ma10_low * 0.98)
+            
+            # Low candle kena touch zone (dalam 1% range)
+            touch_zone = (
+                (low <= ma5_low * 1.01 and low >= ma5_low * 0.99) or 
+                (low <= ma10_low * 1.01 and low >= ma10_low * 0.99)
             )
             
-            # Close must recover near zone (bullish rejection)
-            close_near_zone = close >= ma5_low * 0.98
+            # Close kena recover balik dekat zone (bullish rejection)
+            close_near_zone = close >= ma5_low * 0.99
             
+            # Close tak boleh exceed MA5/10 High dan Mid BB (Rules BBMA)
             valid_reentry = (
-                in_zone and
+                price_not_crashed and
+                touch_zone and
                 close_near_zone and
                 close <= ma5_high and
                 close <= ma10_high and
@@ -299,7 +309,7 @@ def scan_pair(ticker: str):
             msg = f"""
 🟢 <b>BBMA BUY SETUP DETECTED</b>
 
-📊 Pair: {pair_name}
+ Pair: {pair_name}
 💰 Current Price: ${current_price:.2f}
 ⏱️ Style: {style}
 📈 Pattern: Bullish Re-Entry (After CSA)
