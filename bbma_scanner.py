@@ -3,7 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 from enum import Enum
 
@@ -16,11 +16,12 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Missing Telegram credentials in GitHub Secrets!")
 
-PAIRS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD', 'XRP-USD', 'RENDER-USD']
+# Pairs for Crypto (YFinance Tickers)
+PAIRS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD', 'XRP-USD']
 
 STYLES = {
-    'Intraday': {'big': '4h', 'small': '1h', 'period_big': '300d', 'period_small': '300d'},
-    'Swing': {'big': '1d', 'small': '4h', 'period_big': '730d', 'period_small': '730d'}
+    'Intraday': {'big': '4h', 'small': '1h', 'lookback_days': 60}, # Lookback 60 days cukup untuk 300 candles 4h
+    'Swing': {'big': '1d', 'small': '4h', 'lookback_days': 365}   # Lookback 1 year untuk daily
 }
 
 BB_PERIOD = 20
@@ -43,9 +44,20 @@ def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period).apply(lwma, raw=True)
 
 def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [col.capitalize() for col in df.columns]
     df = df.copy()
     
+    # Standardize column names just in case
+    if 'Close' not in df.columns:
+        # Try to find close price column
+        close_col = [c for c in df.columns if 'close' in c.lower()]
+        if close_col:
+            df['Close'] = df[close_col[0]]
+            df['Open'] = df[[c for c in df.columns if 'open' in c.lower()][0]]
+            df['High'] = df[[c for c in df.columns if 'high' in c.lower()][0]]
+            df['Low'] = df[[c for c in df.columns if 'low' in c.lower()][0]]
+        else:
+            return pd.DataFrame() # Cannot proceed without OHLC
+
     df['bb_mid'] = df['Close'].rolling(BB_PERIOD).mean()
     bb_std = df['Close'].rolling(BB_PERIOD).std()
     df['bb_upper'] = df['bb_mid'] + (bb_std * BB_STD)
@@ -59,6 +71,59 @@ def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ema50'] = df['Close'].ewm(span=50, adjust=False).mean()
     
     return df.dropna()
+
+# ==========================================
+# DATA FETCHER WITH VALIDATION (YFINANCE)
+# ==========================================
+def fetch_yfinance_data(ticker: str, interval: str, lookback_days: int) -> pd.DataFrame:
+    """
+    Fetches data from YFinance with strict validation to ensure 
+    we are getting current 2026 data and not cached/historical glitches.
+    """
+    try:
+        # Calculate start date to ensure we get enough data but focus on recent
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=lookback_days)
+        
+        # Download data
+        df = yf.download(ticker, start=start_date, end=end_date, interval=interval, progress=False)
+        
+        if df.empty:
+            print(f"❌ No data for {ticker} ({interval})")
+            return pd.DataFrame()
+        
+        # Handle MultiIndex columns if present (common in newer yfinance versions)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+            
+        # Rename to standard if needed
+        df.rename(columns={'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'}, inplace=True)
+        
+        # --- CRITICAL VALIDATION FOR 2026 DATA ---
+        # Check if the last candle's date is within the last 24-48 hours.
+        # If the last candle is older than 2 days, data might be stale/cached incorrectly.
+        last_candle_time = df.index[-1]
+        if isinstance(last_candle_time, pd.Timestamp):
+            time_diff = datetime.now(last_candle_time.tzinfo) - last_candle_time
+            if time_diff.total_seconds() > 172800: # 48 hours
+                print(f"⚠️ WARNING: Data for {ticker} seems stale. Last candle: {last_candle_time}. Skipping.")
+                return pd.DataFrame()
+        
+        # Check for obvious price outliers (e.g., ETH at $4000 when it should be ~$1600)
+        # We compare the last close with the median of the last 10 candles to detect sudden jumps
+        recent_median = df['Close'].iloc[-10:].median()
+        last_close = df['Close'].iloc[-1]
+        
+        # If price deviates more than 20% from recent median, it's likely a glitch or wrong ticker data
+        if abs(last_close - recent_median) / recent_median > 0.20:
+            print(f"⚠️ WARNING: Price anomaly detected for {ticker}. Last: {last_close}, Median: {recent_median}. Skipping.")
+            return pd.DataFrame()
+
+        return df
+        
+    except Exception as e:
+        print(f"❌ Error fetching {ticker}: {e}")
+        return pd.DataFrame()
 
 # ==========================================
 # TELEGRAM ALERT
@@ -79,11 +144,6 @@ def send_telegram(message: str):
 # BBMA STATE MACHINE (BUY ONLY)
 # ==========================================
 class BBMABuyTracker:
-    """
-    Tracks BBMA BUY cycle sequentially per Oma Ally:
-    Extreme Buy → TPW → MHV → CSA → Re-Entry Buy
-    """
-    
     def __init__(self):
         self.state = BBMAState.NONE
         self.extreme_low = None
@@ -97,10 +157,6 @@ class BBMABuyTracker:
         self.csa_confirmed = False
     
     def update(self, row: pd.Series, prev_row: pd.Series) -> Optional[Dict]:
-        """
-        Process one candle sequentially and return setup dict if valid Re-Entry Buy detected.
-        Returns None otherwise.
-        """
         close = row['Close']
         open_ = row['Open']
         high = row['High']
@@ -119,7 +175,6 @@ class BBMABuyTracker:
         prev_bearish = prev_row['Close'] < prev_row['Open']
         
         # --- CHECK EXTREME BUY ---
-        # MA5/10 Low keluar dari Low BB + Reverse Candle (Bullish after Bearish)
         extreme_buy = (
             (ma5_low < bb_lower or ma10_low < bb_lower) and
             is_bullish and prev_bearish
@@ -134,8 +189,6 @@ class BBMABuyTracker:
         
         # --- CHECK MHV AFTER EXTREME BUY ---
         if self.state == BBMAState.EXTREME_BUY:
-            # MHV Buy: Price TAK close bawah Low BB + Reverse Candle (Bearish)
-            # Price gagal teruskan momentum turun
             mhv_valid = (close >= bb_lower) and is_bearish and prev_bullish
             
             if mhv_valid:
@@ -143,16 +196,13 @@ class BBMABuyTracker:
                 self.mhv_confirmed = True
                 return None
             
-            # MHV batal jika close bawah Low BB (momentum sambung)
             if close < bb_lower:
                 self.reset()
                 return None
         
         # --- CHECK CSA AFTER MHV ---
         if self.state == BBMAState.MHV_BUY and self.mhv_confirmed:
-            # CSA Buy: Close atas MA5/10 Low (early) atau atas Mid BB (strong)
             csa_early = close > ma5_low and close > ma10_low
-            csa_strong = csa_early and close > bb_mid
             
             if csa_early:
                 self.state = BBMAState.CSA_BUY
@@ -161,15 +211,13 @@ class BBMABuyTracker:
         
         # --- CHECK RE-ENTRY BUY (ONLY AFTER CSA) ---
         if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
-            # Re-Entry Buy: Price retrace ke MA5/10 Low zone
-            # Close TIDAK boleh exceed MA5/10 High atau Mid BB
             in_zone = (low <= ma5_low * 1.003) or (low <= ma10_low * 1.003)
             valid_reentry = (
                 in_zone and
                 close <= ma5_high and
                 close <= ma10_high and
                 close <= bb_mid and
-                is_bullish and prev_bearish  # Reverse candle confirmation
+                is_bullish and prev_bearish
             )
             
             if valid_reentry:
@@ -188,20 +236,14 @@ class BBMABuyTracker:
         return None
 
 # ==========================================
-# LEVEL CALCULATION (STRICT BBMA)
+# LEVEL CALCULATION
 # ==========================================
 def calculate_levels_buy(setup: Dict) -> Dict:
-    """
-    BUY Levels (Oma Ally):
-    - Entry: MA5 Low (aggressive) / MA10 Low (conservative)
-    - SL: Below BB Lower (bukan percentage)
-    - TP1: MA5/10 High | TP2: BB Upper | TP3: BB Upper + buffer
-    """
     entry_aggressive = setup['ma5_low']
     entry_conservative = setup['ma10_low']
     entry_moderate = (entry_aggressive + entry_conservative) / 2
     
-    sl = setup['bb_lower']  # SL strictly below BB Lower
+    sl = setup['bb_lower']
     
     tp1 = setup['ma5_high']
     tp2 = setup['bb_upper']
@@ -215,7 +257,7 @@ def calculate_levels_buy(setup: Dict) -> Dict:
     }
 
 # ==========================================
-# SCANNER WITH STATE TRACKING
+# SCANNER
 # ==========================================
 def scan_pair(ticker: str):
     tracker = BBMABuyTracker()
@@ -224,53 +266,53 @@ def scan_pair(ticker: str):
         print(f"Scanning {ticker} ({style})...")
         
         try:
-            # Fetch Big TF data
-            df_big = yf.download(ticker, interval=tfs['big'], period=tfs['period_big'], progress=False)
-            if df_big.empty or len(df_big) < 60:
+            # Fetch Big TF
+            df_big = fetch_yfinance_data(ticker, tfs['big'], tfs['lookback_days'])
+            if df_big.empty:
                 continue
-            if isinstance(df_big.columns, pd.MultiIndex):
-                df_big.columns = df_big.columns.get_level_values(0)
             df_big = get_indicators(df_big)
-            
-            # Check Uptrend on Big TF (EMA50 below Mid BB)
+            if df_big.empty:
+                continue
+                
             last_big = df_big.iloc[-1]
             uptrend = last_big['ema50'] < last_big['bb_mid']
             
             if not uptrend:
-                print(f"ℹ️ {ticker} ({style}) - No uptrend on big TF")
+                # print(f"ℹ️ {ticker} ({style}) - No uptrend on big TF")
                 continue
             
-            # Fetch Small TF data
-            df_small = yf.download(ticker, interval=tfs['small'], period=tfs['period_small'], progress=False)
-            if df_small.empty or len(df_small) < 60:
+            # Fetch Small TF
+            df_small = fetch_yfinance_data(ticker, tfs['small'], tfs['lookback_days'])
+            if df_small.empty:
                 continue
-            if isinstance(df_small.columns, pd.MultiIndex):
-                df_small.columns = df_small.columns.get_level_values(0)
             df_small = get_indicators(df_small)
+            if df_small.empty:
+                continue
             
-            # Reset tracker for this pair/style
             tracker.reset()
             
-            # Walk through small TF candles sequentially to track BBMA cycle
             setup_found = None
+            # Walk through candles sequentially
             for i in range(1, len(df_small)):
                 result = tracker.update(df_small.iloc[i], df_small.iloc[i-1])
                 if result is not None:
                     setup_found = result
-                    break  # First valid setup in current cycle
+                    break
             
             if setup_found is None:
-                print(f"ℹ️ {ticker} ({style}) - No valid BBMA BUY setup (cycle incomplete)")
                 continue
             
-            # Calculate levels and send alert
             levels = calculate_levels_buy(setup_found)
             pair_name = ticker.replace('-USD', '/USDT')
             
+            # Get current live price for verification in message
+            current_price = df_small.iloc[-1]['Close']
+            
             msg = f"""
-🟢 <b>BBMA BUY SETUP DETECTED</b>
+ <b>BBMA BUY SETUP DETECTED</b>
 
 📊 Pair: {pair_name}
+💰 Current Price: ${current_price:.2f}
 ⏱️ Style: {style}
 📈 Pattern: Bullish Re-Entry (After CSA)
 ✅ Cycle: Extreme → MHV → CSA → Re-Entry CONFIRMED
@@ -278,33 +320,29 @@ def scan_pair(ticker: str):
 ━━━━━━━━━━━━━━━━━━━━
 
 🟢 <b>CONSERVATIVE ENTRY</b>
-Paling selamat, tunggu confirmation penuh
-• Entry: {levels['conservative']['entry']:.4f}
-• SL: {levels['conservative']['sl']:.4f}
-• TP1: {levels['tp1']:.4f} | TP2: {levels['tp2']:.4f} | TP3: {levels['tp3']:.4f}
+• Entry: {levels['conservative']['entry']:.2f}
+• SL: {levels['conservative']['sl']:.2f}
+• TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
 
 🟡 <b>MODERATE ENTRY</b>
-Balance risk & reward
-• Entry: {levels['moderate']['entry']:.4f}
-• SL: {levels['moderate']['sl']:.4f}
-• TP1: {levels['tp1']:.4f} | TP2: {levels['tp2']:.4f} | TP3: {levels['tp3']:.4f}
+• Entry: {levels['moderate']['entry']:.2f}
+• SL: {levels['moderate']['sl']:.2f}
+• TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
 
-🔴 <b>AGGRESSIVE ENTRY</b>
-Entry awal, harga terbaik, risiko tinggi
-• Entry: {levels['aggressive']['entry']:.4f}
-• SL: {levels['aggressive']['sl']:.4f}
-• TP1: {levels['tp1']:.4f} | TP2: {levels['tp2']:.4f} | TP3: {levels['tp3']:.4f}
+ <b>AGGRESSIVE ENTRY</b>
+• Entry: {levels['aggressive']['entry']:.2f}
+• SL: {levels['aggressive']['sl']:.2f}
+• TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
 
 ━━━━━━━━━━━━━━━━━━━━
 
-⚠️ <i>Pilih 1 level je ikut risk appetite kau! Verify live price on exchange.</i>
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
+️ <i>Verify live price on exchange. Setup based on data from {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>
             """
             send_telegram(msg)
-            print(f"🚨 BUY SETUP FOUND: {ticker} ({style})")
+            print(f"🚨 BUY SETUP FOUND: {ticker} ({style}) @ ${current_price:.2f}")
                 
         except Exception as e:
-            print(f"❌ Error {ticker} {style}: {e}")
+            print(f" Error {ticker} {style}: {e}")
 
 # ==========================================
 # MAIN
