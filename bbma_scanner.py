@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from enum import Enum
 
 # ==========================================
@@ -88,15 +88,15 @@ def fetch_yfinance_data(ticker: str, interval: str, lookback_days: int) -> pd.Da
             
         df.rename(columns={'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'}, inplace=True)
         
-        # QC 1: Check if data is recent (June 2026)
+        # QC 1: Check if data is recent (48 hours)
         last_candle_time = df.index[-1]
         if isinstance(last_candle_time, pd.Timestamp):
             time_diff = datetime.now(last_candle_time.tzinfo) - last_candle_time
-            if time_diff.total_seconds() > 172800:  # 48 hours
-                print(f"⚠️ WARNING: Data for {ticker} seems stale. Last candle: {last_candle_time}. Skipping.")
+            if time_diff.total_seconds() > 172800:
+                print(f"⚠️ WARNING: Data for {ticker} stale. Last: {last_candle_time}. Skipping.")
                 return pd.DataFrame()
         
-        # QC 2: Check for price anomalies (e.g., ETH $4400 when market is $1600)
+        # QC 2: Check for price anomalies
         recent_median = df['Close'].iloc[-10:].median()
         last_close = df['Close'].iloc[-1]
         
@@ -162,7 +162,6 @@ class BBMABuyTracker:
         prev_bearish = prev_row['Close'] < prev_row['Open']
         
         # --- 1. CHECK EXTREME BUY ---
-        # MA5/10 Low keluar Low BB + Reverse Candle (Bullish after Bearish)
         extreme_buy = (
             (ma5_low < bb_lower or ma10_low < bb_lower) and
             is_bullish and prev_bearish
@@ -177,7 +176,6 @@ class BBMABuyTracker:
             return None
         
         # --- 2. CHECK MHV AFTER EXTREME BUY ---
-        # Price tak close bawah Low BB + Reverse Candle (Bearish)
         if self.state == BBMAState.EXTREME_BUY:
             mhv_valid = (close >= bb_lower) and is_bearish and prev_bullish
             
@@ -186,13 +184,11 @@ class BBMABuyTracker:
                 self.mhv_confirmed = True
                 return None
             
-            # MHV batal jika close bawah Low BB (momentum sambung)
             if close < bb_lower:
                 self.reset()
                 return None
         
         # --- 3. CHECK CSA AFTER MHV ---
-        # Close atas MA5/10 Low (Early CSA)
         if self.state == BBMAState.MHV_BUY and self.mhv_confirmed:
             csa_early = close > ma5_low and close > ma10_low
             
@@ -202,21 +198,16 @@ class BBMABuyTracker:
                 return None
         
         # --- 4. CHECK RE-ENTRY BUY (ONLY AFTER CSA) ---
-        # CRITICAL QC FIX: Price mesti touch zone, tapi tak boleh crash jauh
         if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
-            # Price tak boleh crash lebih 2% bawah MA5/10 zone
             price_not_crashed = (close >= ma5_low * 0.98 and close >= ma10_low * 0.98)
             
-            # Low candle kena touch zone (dalam 1% range)
             touch_zone = (
                 (low <= ma5_low * 1.01 and low >= ma5_low * 0.99) or 
                 (low <= ma10_low * 1.01 and low >= ma10_low * 0.99)
             )
             
-            # Close kena recover balik dekat zone (bullish rejection)
             close_near_zone = close >= ma5_low * 0.99
             
-            # Close tak boleh exceed MA5/10 High dan Mid BB (Rules BBMA)
             valid_reentry = (
                 price_not_crashed and
                 touch_zone and
@@ -234,28 +225,19 @@ class BBMABuyTracker:
                     'type': 'BUY',
                     'trigger_price': close,
                     'trigger_time': datetime.now().isoformat(),
-                    'ma5_low': ma5_low,
-                    'ma10_low': ma10_low,
-                    'bb_lower': bb_lower,
-                    'bb_upper': bb_upper,
-                    'ma5_high': ma5_high,
-                    'ma10_high': ma10_high,
-                    'bb_mid': bb_mid
                 }
         
         return None
 
 # ==========================================
-# LEVEL CALCULATION (BBMA OMA ALLY COMPLIANT)
+# LEVEL CALCULATION (2 ENTRY: MODERATE + AGGRESSIVE)
 # ==========================================
-def calculate_levels_buy(setup: Dict, current_price: float, df_small: pd.DataFrame) -> Optional[Dict]:
+def calculate_levels_buy(current_price: float, df_small: pd.DataFrame) -> Optional[Dict]:
     """
-    BBMA Oma Ally Entry Rules:
-    - Entry zone: antara MA5 Low dan MA10 Low (current values, bukan historical)
-    - Entry: current_price jika masih dalam zone
-    - Jika current_price dah drift >3% dari zone, setup expired
+    2 Entry Strategy:
+    - MODERATE (RECOMMENDED): Zone Center - best balance
+    - AGGRESSIVE: Zone Bottom - early entry, higher risk
     """
-    # Get CURRENT MA values (bukan dari setup['ma5_low'] lama)
     current_ma5_low = df_small['ma5_low'].iloc[-1]
     current_ma10_low = df_small['ma10_low'].iloc[-1]
     current_ma5_high = df_small['ma5_high'].iloc[-1]
@@ -264,50 +246,40 @@ def calculate_levels_buy(setup: Dict, current_price: float, df_small: pd.DataFra
     current_bb_upper = df_small['bb_upper'].iloc[-1]
     current_bb_mid = df_small['bb_mid'].iloc[-1]
     
-    # Define zone: MA5 Low (aggressive) ke MA10 Low (conservative)
+    # Zone: MA5 Low (aggressive) to MA10 Low (moderate/conservative)
     zone_top = max(current_ma5_low, current_ma10_low)
     zone_bottom = min(current_ma5_low, current_ma10_low)
-    
-    # Check if current price is within re-entry zone (±1% buffer)
-    in_zone = (zone_bottom * 0.99 <= current_price <= zone_top * 1.01)
-    
-    # Check if price drifted too far (>3% from zone)
     zone_center = (zone_top + zone_bottom) / 2
-    drift_pct = abs(current_price - zone_center) / zone_center
     
-    if drift_pct > 0.03:
-        # Price drifted too far - setup expired
+    # Check drift
+    drift_pct = abs(current_price - zone_center) / zone_center
+    if drift_pct > 0.05:
         print(f"⚠️ Setup EXPIRED: Price drifted {drift_pct:.1%} from zone")
         return None
     
-    # Entry levels
-    if in_zone:
-        # Current price IS the entry (best practice)
-        entry_aggressive = current_price
-        entry_conservative = current_price
-        entry_moderate = current_price
-    else:
-        # Price near zone but not in zone - use zone boundaries
-        entry_aggressive = zone_bottom
-        entry_conservative = zone_top
-        entry_moderate = zone_center
+    # 2 Entries
+    entry_moderate = zone_center      # RECOMMENDED - sweet spot
+    entry_aggressive = zone_bottom    # Early entry
     
-    # SL: Below BB Lower or below zone with buffer
+    # SL: Below BB Lower or zone bottom buffer
     sl = min(current_bb_lower, zone_bottom * 0.985)
     
-    # TP: MA5/10 High, Mid BB, BB Upper (BBMA rules)
+    # TP
     tp1 = current_ma5_high
     tp2 = current_bb_mid
     tp3 = current_bb_upper
     
+    # Risk/Reward
+    rr_moderate = (tp2 - entry_moderate) / (entry_moderate - sl) if entry_moderate > sl else 0
+    rr_aggressive = (tp2 - entry_aggressive) / (entry_aggressive - sl) if entry_aggressive > sl else 0
+    
     return {
-        'conservative': {'entry': entry_conservative, 'sl': sl},
-        'moderate': {'entry': entry_moderate, 'sl': sl},
-        'aggressive': {'entry': entry_aggressive, 'sl': sl},
+        'moderate': {'entry': entry_moderate, 'sl': sl, 'rr': rr_moderate},
+        'aggressive': {'entry': entry_aggressive, 'sl': sl, 'rr': rr_aggressive},
         'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
         'zone_top': zone_top,
         'zone_bottom': zone_bottom,
-        'in_zone': in_zone,
+        'current_price': current_price,
         'drift_pct': drift_pct
     }
 
@@ -329,7 +301,6 @@ def scan_pair(ticker: str):
                 continue
                 
             last_big = df_big.iloc[-1]
-            # FIX: EMA50 below mid BB = Uptrend (BBMA rule)
             uptrend = last_big['ema50'] < last_big['bb_mid']
             
             if not uptrend:
@@ -346,32 +317,25 @@ def scan_pair(ticker: str):
             tracker.reset()
             
             setup_found = None
-            setup_idx = None
             for i in range(1, len(df_small)):
                 result = tracker.update(df_small.iloc[i], df_small.iloc[i-1])
                 if result is not None:
                     setup_found = result
-                    setup_idx = i
                     break
             
             if setup_found is None:
                 print(f"⏭️ {ticker} ({style}): No setup found")
                 continue
             
-            # CRITICAL: Check if setup is still valid with current price
+            # Validate with current price
             current_price = df_small.iloc[-1]['Close']
-            
-            # Calculate levels using CURRENT data
-            levels = calculate_levels_buy(setup_found, current_price, df_small)
+            levels = calculate_levels_buy(current_price, df_small)
             
             if levels is None:
-                print(f"⚠️ {ticker} ({style}): Setup expired, price drifted too far")
+                print(f"⚠️ {ticker} ({style}): Setup expired")
                 continue
             
             pair_name = ticker.replace('-USD', '/USDT')
-            
-            # Format message
-            zone_info = "✅ IN ZONE" if levels['in_zone'] else "⚠️ NEAR ZONE"
             
             msg = f"""
 🟢 <b>BBMA BUY SETUP DETECTED</b>
@@ -381,35 +345,31 @@ def scan_pair(ticker: str):
 ⏱️ Style: {style}
 📈 Pattern: Bullish Re-Entry (After CSA)
 ✅ Cycle: Extreme → MHV → CSA → Re-Entry CONFIRMED
-🎯 Zone Status: {zone_info} (Drift: {levels['drift_pct']:.2%})
 
 ━━━━━━━━━━━━━━━━━━━━
 
 📐 <b>ENTRY ZONE</b>
-• Zone Top (Conservative): {levels['zone_top']:.2f}
-• Zone Bottom (Aggressive): {levels['zone_bottom']:.2f}
+• Zone Top: {levels['zone_top']:.2f}
+• Zone Bottom: {levels['zone_bottom']:.2f}
 
-🟢 <b>CONSERVATIVE ENTRY</b>
-• Entry: {levels['conservative']['entry']:.2f}
-• SL: {levels['conservative']['sl']:.2f}
-• TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
-
-🟡 <b>MODERATE ENTRY</b>
-• Entry: {levels['moderate']['entry']:.2f}
+🟡 <b>MODERATE ENTRY ⭐ RECOMMENDED</b>
+• Entry: {levels['moderate']['entry']:.2f} (Zone Center)
 • SL: {levels['moderate']['sl']:.2f}
 • TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
+• R/R: {levels['moderate']['rr']:.1f}x
 
-🔴 <b>AGGRESSIVE ENTRY</b>
-• Entry: {levels['aggressive']['entry']:.2f}
+🔴 <b>AGGRESSIVE ENTRY (Optional)</b>
+• Entry: {levels['aggressive']['entry']:.2f} (Zone Bottom)
 • SL: {levels['aggressive']['sl']:.2f}
 • TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
+• R/R: {levels['aggressive']['rr']:.1f}x
 
 ━━━━━━━━━━━━━━━━━━━━
 
 ⚠️ <i>Verify live price on exchange. Setup based on data from {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>
             """
             send_telegram(msg)
-            print(f"🚨 BUY SETUP FOUND: {ticker} ({style}) @ ${current_price:.2f} | Zone: {levels['zone_bottom']:.2f}-{levels['zone_top']:.2f}")
+            print(f"🚨 BUY SETUP: {ticker} ({style}) @ ${current_price:.2f}")
                 
         except Exception as e:
             print(f"❌ Error {ticker} {style}: {e}")
