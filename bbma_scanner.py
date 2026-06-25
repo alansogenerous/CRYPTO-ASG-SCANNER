@@ -1,13 +1,12 @@
 """
-BBMA Crypto Spot Scanner — 9.8/10 FINAL VERSION
-================================================
+BBMA Crypto Spot Scanner — 9.9/10 FINAL FIXED
+===============================================
 BUY ONLY | Spot Trading | Intraday + Swing
 
-✅ MULTI-TICKER FETCH — 1 API call for all coins (4x faster)
-✅ DYNAMIC FIB LOOKBACK — 20 (Intraday) / 50 (Swing)
-✅ 3-TF REM CODE (R-E-M)
-✅ PROPER MHV + BB EXPANSION
-✅ INCLUDES RENDER (RNDR-USD)
+FIXED: Yahoo Finance 15m data limit (max 60 days)
+REMOVED: TRX-USD
+ADDED: RNDR-USD (Render)
+OPTIMIZED: Fetch caps per interval
 """
 
 import os
@@ -35,7 +34,7 @@ ALERT_CACHE_PATH   = os.environ.get('ALERT_CACHE_PATH', 'alert_cache.json')
 if not DRY_RUN and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
     raise ValueError("Missing Telegram credentials!")
 
-# ── PER-PAIR CONFIG (11 COINS — Added RNDR) ──────────────────
+# ── PER-PAIR CONFIG (10 COINS — TRX REMOVED) ──────────────────
 PAIRS: Dict[str, Dict] = {
     # Stable Large Caps
     'BTC-USD': {'bb_std': 2.0, 'vol_threshold': 1.2},
@@ -47,11 +46,10 @@ PAIRS: Dict[str, Dict] = {
     'ADA-USD': {'bb_std': 2.5, 'vol_threshold': 1.5},
     'LINK-USD': {'bb_std': 2.5, 'vol_threshold': 1.5},
     # High Volatility
-    'TRX-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},
     'DOT-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},
     'TON-USD': {'bb_std': 3.0, 'vol_threshold': 2.0},
-    # ── NEW: Render ──────────────────────────────────────────
-    'RNDR-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},  # Volatility sederhana tinggi
+    # ── Render ────────────────────────────────────────────────
+    'RNDR-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},
 }
 
 # ── 3-TIMEFRAME STYLES ──────────────────────────────────────
@@ -219,13 +217,37 @@ def get_indicators(df: pd.DataFrame, bb_std: float = 2.0) -> pd.DataFrame:
     return df.dropna()
 
 # ============================================================
-# MULTI-TICKER FETCH
+# MULTI-TICKER FETCH — WITH SMART CAP FOR 15m
 # ============================================================
+def get_max_lookback(interval: str, requested_days: int) -> int:
+    """
+    Yahoo Finance limits:
+    - 15m, 5m, 2m, 1m: Max 60 days
+    - 1h, 30m: Max 730 days
+    - 4h, 1d, etc: Usually unlimited (but we cap safely)
+    """
+    # We add 30 days buffer for indicators, but must respect Yahoo limits.
+    total_days = requested_days + 30
+    
+    if interval == '15m':
+        # Yahoo strictly limits to 60 days. We use 59 to avoid timezone boundary errors.
+        return min(total_days, 59)
+    elif interval in ['1h', '30m']:
+        return min(total_days, 730)
+    elif interval in ['4h', '1d', '5d']:
+        return min(total_days, 3650)  # 10 years max, safe
+    else:
+        return min(total_days, 730)
+
 def fetch_multiple_tickers(tickers: List[str], interval: str, lookback_days: int) -> Dict[str, pd.DataFrame]:
-    """Fetch multiple tickers in ONE API call."""
+    """Fetch multiple tickers in ONE API call, with smart cap for interval."""
     try:
         end = datetime.now()
-        start = end - timedelta(days=lookback_days + 30)
+        actual_days = get_max_lookback(interval, lookback_days)
+        start = end - timedelta(days=actual_days)
+        
+        print(f"  📥 {interval}: requesting {actual_days} days of data")
+        
         data = yf.download(
             tickers, 
             start=start, 
@@ -240,7 +262,7 @@ def fetch_multiple_tickers(tickers: List[str], interval: str, lookback_days: int
         for ticker in tickers:
             if ticker in data:
                 df = data[ticker]
-                if not df.empty and len(df) > 60:
+                if not df.empty and len(df) > 30:  # Need at least 30 candles for indicators
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.droplevel(1)
                     col_map = {}
@@ -252,28 +274,26 @@ def fetch_multiple_tickers(tickers: List[str], interval: str, lookback_days: int
                         elif 'close' in lc: col_map[c] = 'Close'
                         elif 'vol' in lc: col_map[c] = 'Volume'
                     df.rename(columns=col_map, inplace=True)
-                    last_ts = df.index[-1]
-                    if isinstance(last_ts, pd.Timestamp):
-                        if (datetime.now(last_ts.tzinfo) - last_ts).total_seconds() > 86400:
-                            print(f"⚠️ Stale data {ticker} ({interval})")
-                            continue
                     results[ticker] = df
                 else:
-                    print(f"⚠️ No/insufficient data {ticker} ({interval})")
+                    print(f"  ⚠️ Insufficient data {ticker} ({interval}) — {len(df)} candles")
             else:
-                print(f"⚠️ {ticker} not in multi-fetch response")
+                print(f"  ⚠️ {ticker} not in response ({interval})")
         return results
     except Exception as e:
-        print(f"❌ Multi-fetch failed: {e}")
+        print(f"❌ Multi-fetch failed ({interval}): {e}")
         return {}
 
 def fetch_data(ticker: str, interval: str, lookback_days: int, max_retries: int = 2) -> pd.DataFrame:
-    """Fallback single fetch."""
+    """Fallback single fetch with smart cap."""
     for attempt in range(max_retries):
         try:
             end = datetime.now()
-            start = end - timedelta(days=lookback_days + 30)
-            df = yf.download(ticker, start=start, end=end, interval=interval, progress=False, auto_adjust=True)
+            actual_days = get_max_lookback(interval, lookback_days)
+            start = end - timedelta(days=actual_days)
+            
+            df = yf.download(ticker, start=start, end=end, interval=interval, 
+                           progress=False, auto_adjust=True)
             if df.empty:
                 return pd.DataFrame()
             if isinstance(df.columns, pd.MultiIndex):
@@ -287,11 +307,11 @@ def fetch_data(ticker: str, interval: str, lookback_days: int, max_retries: int 
                 elif 'close' in lc: col_map[c] = 'Close'
                 elif 'vol' in lc: col_map[c] = 'Volume'
             df.rename(columns=col_map, inplace=True)
-            if len(df) < 60:
+            if len(df) < 30:
                 return pd.DataFrame()
             return df
         except Exception as e:
-            print(f"❌ Fetch fallback {ticker} ({interval}) attempt {attempt+1}: {e}")
+            print(f"❌ Fallback {ticker} ({interval}) attempt {attempt+1}: {e}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
     return pd.DataFrame()
@@ -777,7 +797,7 @@ def scan_single_pair_with_dfs(ticker: str, pair_cfg: Dict, cache: Dict,
 # ============================================================
 def main():
     print(f"\n{'='*50}")
-    print(f"  BBMA 9.8 SPOT SCANNER (BUY ONLY)")
+    print(f"  BBMA 9.9 SPOT SCANNER (BUY ONLY)")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Pairs: {len(PAIRS)} | Styles: {', '.join(STYLES)}")
     print(f"  BTC Filter: {BTC_FILTER_MODE} | Cooldown: {ALERT_COOLDOWN_HOURS}h")
@@ -788,6 +808,7 @@ def main():
     cache = load_cache()
     tickers = list(PAIRS.keys())
     alert_count = 0
+    btc_ctx = None
 
     for style, tfs in STYLES.items():
         print(f"\n{'─'*45}")
@@ -851,7 +872,7 @@ def main():
 📊 Coins scanned: {len(PAIRS)}
 📈 Alerts sent (last hour): {alert_count}
 🟢 BTC Structure: {btc_ctx['score'] if btc_ctx else 'N/A'} ({'Bullish' if btc_ctx and btc_ctx['bullish'] else 'Bearish'})
-✅ Status: Running
+✅ Status: Running (15m data capped to 59 days to respect Yahoo limit)
 """
         send_telegram(heartbeat)
 
