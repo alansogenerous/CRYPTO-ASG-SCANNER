@@ -1,12 +1,12 @@
 """
-BBMA Crypto Spot Scanner — 9.9/10 FINAL FIXED
-===============================================
+BBMA Crypto Spot Scanner — 9.9 FINAL (No BTC Blocker)
+=======================================================
 BUY ONLY | Spot Trading | Intraday + Swing
 
-FIXED: Yahoo Finance 15m data limit (max 60 days)
-REMOVED: TRX-USD
-ADDED: RNDR-USD (Render)
-OPTIMIZED: Fetch caps per interval
+✅ BTC filter DISABLED as blocker — now just a bonus/confidence metric
+✅ Added RENDER-USD (new ticker)
+✅ 15m data capped to 59 days
+✅ Scans all 10 coins regardless of BTC direction
 """
 
 import os
@@ -34,7 +34,7 @@ ALERT_CACHE_PATH   = os.environ.get('ALERT_CACHE_PATH', 'alert_cache.json')
 if not DRY_RUN and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
     raise ValueError("Missing Telegram credentials!")
 
-# ── PER-PAIR CONFIG (10 COINS — TRX REMOVED) ──────────────────
+# ── PER-PAIR CONFIG (10 COINS — WITH RENDER) ──────────────────
 PAIRS: Dict[str, Dict] = {
     # Stable Large Caps
     'BTC-USD': {'bb_std': 2.0, 'vol_threshold': 1.2},
@@ -48,8 +48,8 @@ PAIRS: Dict[str, Dict] = {
     # High Volatility
     'DOT-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},
     'TON-USD': {'bb_std': 3.0, 'vol_threshold': 2.0},
-    # ── Render ────────────────────────────────────────────────
-    'RNDR-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},
+    # ── Render (NEW TICKER) ──────────────────────────────────
+    'RENDER-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},  # Render (RENDER-USD)
 }
 
 # ── 3-TIMEFRAME STYLES ──────────────────────────────────────
@@ -84,7 +84,6 @@ MIN_RR               = 1.5
 MAX_DRIFT_PCT        = 0.06
 ALERT_COOLDOWN_HOURS = 4
 MIN_CONFIDENCE       = 'MEDIUM'
-BTC_FILTER_MODE      = 'soft'
 
 # ============================================================
 # DATA CLASSES
@@ -217,37 +216,25 @@ def get_indicators(df: pd.DataFrame, bb_std: float = 2.0) -> pd.DataFrame:
     return df.dropna()
 
 # ============================================================
-# MULTI-TICKER FETCH — WITH SMART CAP FOR 15m
+# MULTI-TICKER FETCH
 # ============================================================
 def get_max_lookback(interval: str, requested_days: int) -> int:
-    """
-    Yahoo Finance limits:
-    - 15m, 5m, 2m, 1m: Max 60 days
-    - 1h, 30m: Max 730 days
-    - 4h, 1d, etc: Usually unlimited (but we cap safely)
-    """
-    # We add 30 days buffer for indicators, but must respect Yahoo limits.
     total_days = requested_days + 30
-    
     if interval == '15m':
-        # Yahoo strictly limits to 60 days. We use 59 to avoid timezone boundary errors.
         return min(total_days, 59)
     elif interval in ['1h', '30m']:
         return min(total_days, 730)
     elif interval in ['4h', '1d', '5d']:
-        return min(total_days, 3650)  # 10 years max, safe
+        return min(total_days, 3650)
     else:
         return min(total_days, 730)
 
 def fetch_multiple_tickers(tickers: List[str], interval: str, lookback_days: int) -> Dict[str, pd.DataFrame]:
-    """Fetch multiple tickers in ONE API call, with smart cap for interval."""
     try:
         end = datetime.now()
         actual_days = get_max_lookback(interval, lookback_days)
         start = end - timedelta(days=actual_days)
-        
-        print(f"  📥 {interval}: requesting {actual_days} days of data")
-        
+        print(f"  📥 {interval}: requesting {actual_days} days")
         data = yf.download(
             tickers, 
             start=start, 
@@ -262,7 +249,7 @@ def fetch_multiple_tickers(tickers: List[str], interval: str, lookback_days: int
         for ticker in tickers:
             if ticker in data:
                 df = data[ticker]
-                if not df.empty and len(df) > 30:  # Need at least 30 candles for indicators
+                if not df.empty and len(df) > 30:
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.droplevel(1)
                     col_map = {}
@@ -284,38 +271,6 @@ def fetch_multiple_tickers(tickers: List[str], interval: str, lookback_days: int
         print(f"❌ Multi-fetch failed ({interval}): {e}")
         return {}
 
-def fetch_data(ticker: str, interval: str, lookback_days: int, max_retries: int = 2) -> pd.DataFrame:
-    """Fallback single fetch with smart cap."""
-    for attempt in range(max_retries):
-        try:
-            end = datetime.now()
-            actual_days = get_max_lookback(interval, lookback_days)
-            start = end - timedelta(days=actual_days)
-            
-            df = yf.download(ticker, start=start, end=end, interval=interval, 
-                           progress=False, auto_adjust=True)
-            if df.empty:
-                return pd.DataFrame()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.droplevel(1)
-            col_map = {}
-            for c in df.columns:
-                lc = c.lower()
-                if 'open' in lc: col_map[c] = 'Open'
-                elif 'high' in lc: col_map[c] = 'High'
-                elif 'low' in lc: col_map[c] = 'Low'
-                elif 'close' in lc: col_map[c] = 'Close'
-                elif 'vol' in lc: col_map[c] = 'Volume'
-            df.rename(columns=col_map, inplace=True)
-            if len(df) < 30:
-                return pd.DataFrame()
-            return df
-        except Exception as e:
-            print(f"❌ Fallback {ticker} ({interval}) attempt {attempt+1}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-    return pd.DataFrame()
-
 # ============================================================
 # LIQUIDITY & BTC FILTERS
 # ============================================================
@@ -327,6 +282,7 @@ def check_liquidity(df: pd.DataFrame, ticker: str) -> bool:
     return True
 
 def get_btc_structure_from_df(df: pd.DataFrame) -> Optional[Dict]:
+    """Get BTC structure for DISPLAY purposes only — NOT used to block."""
     if df.empty or len(df) < 5:
         return None
     df = get_indicators(df, bb_std=2.0)
@@ -337,8 +293,8 @@ def get_btc_structure_from_df(df: pd.DataFrame) -> Optional[Dict]:
     c2 = bool(last['ema50'] > prev['ema50'])
     c3 = bool(last['obv_bullish'])
     n = sum([c1, c2, c3])
-    bullish = (n >= 2) if BTC_FILTER_MODE == 'soft' else (n == 3)
-    return {'bullish': bullish, 'score': f"{n}/3", 'c1_price': c1, 'c2_slope': c2, 'c3_obv': c3}
+    bullish = (n >= 2)
+    return {'bullish': bullish, 'score': f"{n}/3"}
 
 # ============================================================
 # FUNDING RATE
@@ -577,9 +533,13 @@ def calculate_confidence(df: pd.DataFrame, levels: Dict, signal: Dict,
     else:
         warnings.append("No Fib confluence")
 
+    # ─── BTC IS NOW JUST A BONUS, NOT A BLOCKER ───
     if btc_ctx and btc_ctx['bullish']:
         confirmations.append(f"BTC bullish ({btc_ctx['score']}) ✅")
         score += 1
+    else:
+        # WARNING only, no score penalty, no block
+        warnings.append(f"BTC not bullish ({btc_ctx['score'] if btc_ctx else 'N/A'}) — but scanning anyway")
 
     if funding_rate is not None and funding_rate < 0:
         confirmations.append(f"Funding {funding_rate:.4f}% — shorts paying ✅")
@@ -638,7 +598,7 @@ def build_alert(signal_obj: Signal, tfs: Dict) -> str:
 ━━━━━━━━━━━━━━━━━━━━
 
 🌐 <b>MARKET CONTEXT</b>
-• BTC Structure : {signal_obj.btc_score}
+• BTC Structure : {signal_obj.btc_score} (INFO only — not a blocker)
 • BB Expanding  : {"✅ Yes" if signal_obj.bb_expanding else "❌ No"}
 • ATR (Vol)     : {signal_obj.atr:.4f}  ({signal_obj.atr / signal_obj.entry_moderate * 100:.1f}%){funding_line}{fib_line}
 
@@ -793,16 +753,16 @@ def scan_single_pair_with_dfs(ticker: str, pair_cfg: Dict, cache: Dict,
         traceback.print_exc()
 
 # ============================================================
-# MAIN
+# MAIN — NO BTC BLOCKER
 # ============================================================
 def main():
     print(f"\n{'='*50}")
     print(f"  BBMA 9.9 SPOT SCANNER (BUY ONLY)")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Pairs: {len(PAIRS)} | Styles: {', '.join(STYLES)}")
-    print(f"  BTC Filter: {BTC_FILTER_MODE} | Cooldown: {ALERT_COOLDOWN_HOURS}h")
-    print(f"  Min R/R: {MIN_RR}× | Min Confidence: {MIN_CONFIDENCE}")
-    print(f"  DRY RUN: {DRY_RUN}")
+    print(f"  BTC Filter: DISABLED as blocker (INFO only)")
+    print(f"  Cooldown: {ALERT_COOLDOWN_HOURS}h | Min R/R: {MIN_RR}×")
+    print(f"  Min Confidence: {MIN_CONFIDENCE} | DRY RUN: {DRY_RUN}")
     print(f"{'='*50}")
 
     cache = load_cache()
@@ -836,14 +796,13 @@ def main():
             print("  ⚠️ Small TF fetch failed, skipping style")
             continue
 
+        # ─── BTC CONTEXT — DISPLAY ONLY, NO BLOCK ───
         btc_df = big_data.get('BTC-USD')
         btc_ctx = get_btc_structure_from_df(btc_df) if btc_df is not None else None
         if btc_ctx is None:
-            print("  ⚠️ BTC data unavailable, skipping style")
-            continue
-        if not btc_ctx['bullish']:
-            print(f"  ⏭️ BTC not bullish ({btc_ctx['score']}) — skipping style")
-            continue
+            print("  📊 BTC data unavailable — scanning all pairs anyway")
+        else:
+            print(f"  📊 BTC Structure: {btc_ctx['score']} ({'Bullish' if btc_ctx['bullish'] else 'Bearish'}) — SCANNING ALL PAIRS REGARDLESS")
 
         for ticker, cfg in PAIRS.items():
             df_big = big_data.get(ticker)
@@ -871,8 +830,8 @@ def main():
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
 📊 Coins scanned: {len(PAIRS)}
 📈 Alerts sent (last hour): {alert_count}
-🟢 BTC Structure: {btc_ctx['score'] if btc_ctx else 'N/A'} ({'Bullish' if btc_ctx and btc_ctx['bullish'] else 'Bearish'})
-✅ Status: Running (15m data capped to 59 days to respect Yahoo limit)
+🟢 BTC Structure: {btc_ctx['score'] if btc_ctx else 'N/A'} ({'Bullish' if btc_ctx and btc_ctx['bullish'] else 'Bearish'}) — FOR INFO ONLY
+✅ Status: Running (BTC filter disabled — scanning all pairs regardless)
 """
         send_telegram(heartbeat)
 
