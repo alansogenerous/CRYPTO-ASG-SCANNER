@@ -2,24 +2,23 @@ import os
 import requests
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from datetime import datetime, timezone
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-def get_daily_klines(symbol="BTCUSDT", limit=120):
-    url = f"https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": "1d", "limit": limit}
-    resp = requests.get(url, params=params)
-    data = resp.json()
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "num_trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+def get_daily_klines(symbol="BTC-USD", limit=120):
+    """Ambil data daily dari Yahoo Finance"""
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period=f"{limit}d")
+    # rename kolum ikut style asal
+    df = df.rename(columns={
+        "Open": "open", "High": "high",
+        "Low": "low", "Close": "close", "Volume": "volume"
+    })
+    df = df[["open", "high", "low", "close"]].dropna()
+    df = df.reset_index(drop=True)
     return df
 
 def ema(series, span):
