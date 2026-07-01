@@ -4,15 +4,27 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timezone
+import traceback
 
+# ========== CONFIG ==========
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-def get_daily_klines(symbol="BTC-USD", limit=120):
+SYMBOLS = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD"
+}
+
+STATE_FILES = {
+    "BTC": "signal_state_btc.txt",
+    "ETH": "signal_state_eth.txt"
+}
+
+# ========== FETCH DATA ==========
+def get_daily_klines(symbol, limit=120):
     """Ambil data daily dari Yahoo Finance"""
     ticker = yf.Ticker(symbol)
     df = ticker.history(period=f"{limit}d")
-    # rename kolum ikut style asal
     df = df.rename(columns={
         "Open": "open", "High": "high",
         "Low": "low", "Close": "close", "Volume": "volume"
@@ -21,6 +33,15 @@ def get_daily_klines(symbol="BTC-USD", limit=120):
     df = df.reset_index(drop=True)
     return df
 
+def get_live_price(symbol):
+    """Ambil harga terbaru (intraday) untuk rujukan live"""
+    ticker = yf.Ticker(symbol)
+    data = ticker.history(period="1d", interval="1m")
+    if not data.empty:
+        return data["Close"].iloc[-1]
+    return None
+
+# ========== INDIKATOR ==========
 def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
 
@@ -98,47 +119,79 @@ def get_current_signal(df):
     else:
         return "NO_SIGNAL"
 
+# ========== TELEGRAM ==========
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    requests.post(url, json=payload)
-
-STATE_FILE = "signal_state.txt"
-
-def main():
-    df = get_daily_klines()
-    signal = get_current_signal(df)
-    print(f"Signal sekarang: {signal}")
-
     try:
-        with open(STATE_FILE, "r") as f:
-            last_state = f.read().strip()
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Telegram send failed: {e}")
+
+# ========== STATE MANAGEMENT ==========
+def read_state(filepath):
+    try:
+        with open(filepath, "r") as f:
+            return f.read().strip()
     except FileNotFoundError:
-        last_state = "NO_SIGNAL"
+        return "NO_SIGNAL"
+
+def write_state(filepath, state):
+    with open(filepath, "w") as f:
+        f.write(state)
+
+# ========== MAIN ==========
+def process_symbol(label, yahoo_symbol, state_file):
+    print(f"--- Processing {label} ---")
+    df = get_daily_klines(yahoo_symbol)
+    signal = get_current_signal(df)
+    last_state = read_state(state_file)
+
+    print(f"Signal: {signal}, Last state: {last_state}")
 
     if signal != "NO_SIGNAL" and signal != last_state:
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        price = df["close"].iloc[-1]
+        close_price = df["close"].iloc[-1]
+        live_price = get_live_price(yahoo_symbol)
+        live_str = f"${live_price:,.2f}" if live_price else "N/A"
+
         if signal == "ENTRY_LONG":
             msg = (
-                f"<b>🚀 BTC/USDT LONG SIGNAL</b>\n\n"
-                f"Harga: ${price:,.2f}\n"
+                f"<b>🚀 {label}/USDT LONG SIGNAL</b>\n\n"
+                f"Harga Close (sumber isyarat): ${close_price:,.2f}\n"
+                f"Harga Live: {live_str}\n"
                 f"Masa: {now_utc}\n\n"
                 f"<i>Entry long spot 100% modal.</i>"
             )
         elif signal == "EXIT_LONG":
             msg = (
-                f"<b>🔻 BTC/USDT EXIT SIGNAL</b>\n\n"
-                f"Harga: ${price:,.2f}\n"
+                f"<b>🔻 {label}/USDT EXIT SIGNAL</b>\n\n"
+                f"Harga Close: ${close_price:,.2f}\n"
+                f"Harga Live: {live_str}\n"
                 f"Masa: {now_utc}\n\n"
                 f"<i>Tutup semua posisi long.</i>"
             )
         send_telegram(msg)
-        print("Alert dihantar ke Telegram.")
+        print("Alert sent!")
+        write_state(state_file, signal)
+    else:
+        # Optionally, if no change but signal is active, we could resend? No, keep silent.
+        write_state(state_file, signal)  # ensure state is current
 
-    with open(STATE_FILE, "w") as f:
-        f.write(signal)
-    print(f"State disimpan: {signal}")
+def main():
+    success = True
+    for label, ysym in SYMBOLS.items():
+        try:
+            process_symbol(label, ysym, STATE_FILES[label])
+        except Exception as e:
+            success = False
+            error_msg = f"❌ <b>Error processing {label}</b>\n<pre>{traceback.format_exc()}</pre>"
+            send_telegram(error_msg)
+            print(f"Error on {label}: {traceback.format_exc()}")
+
+    if not success:
+        # force exit non-zero so GitHub Actions marks as failed
+        exit(1)
 
 if __name__ == "__main__":
     main()
