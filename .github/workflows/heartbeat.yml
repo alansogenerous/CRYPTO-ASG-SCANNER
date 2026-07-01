@@ -11,6 +11,7 @@ jobs:
     steps:
       - name: Send heartbeat to Telegram
         run: |
+          MESSAGE="✅ Bot aktif. Tiada isyarat baru. Jam: $(date -u +"%Y-%m-%d %H:%M UTC")"
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-          -H "Content-Type: application/json" \
-          -d '{"chat_id":"${{ secrets.TELEGRAM_CHAT_ID }}", "text":"✅ Bot aktif. Tiada isyarat baru. Jam: '$(date -u +"%Y-%m-%d %H:%M UTC")'", "parse_mode":"HTML"}'
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${{ secrets.TELEGRAM_CHAT_ID }}\", \"text\":\"$MESSAGE\", \"parse_mode\":\"HTML\"}"
