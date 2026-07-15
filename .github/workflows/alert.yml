@@ -1,0 +1,42 @@
+name: SOL Luno Alert Bot (5/5)
+
+on:
+  schedule:
+    - cron: '5 0,4,8,12,16,20 * * *'   # Every 4 hours MYT
+  workflow_dispatch:
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+jobs:
+  alert-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run SOL Enhanced Strategy
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TIMEFRAME: daily   # or '4h' for 4-hour signals
+        run: python src/main.py
+
+      - name: Upload logs on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: sol-bot-logs
+          path: sol_bot.log
+          retention-days: 7
