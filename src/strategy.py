@@ -2,7 +2,7 @@
 import pandas as pd
 import numpy as np
 from typing import Optional, Tuple, Dict
-from src.indicators import calculate_rsi, calculate_sma, calculate_atr, fetch_4h_rsi   # <-- absolute import
+from src.indicators import calculate_rsi, calculate_sma, calculate_atr, fetch_4h_rsi
 
 class FractalMomentumStrategy:
     def __init__(
@@ -40,8 +40,8 @@ class FractalMomentumStrategy:
         self.take_profit = 0.0
     
     def evaluate(self, df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float], Optional[float], Dict]:
-        if len(df) < 200:
-            return (None, None, None, None, {"error": "Insufficient data"})
+        if df is None or len(df) < 200:
+            return (None, None, None, None, {"error": "Insufficient data", "df_len": len(df) if df is not None else 0})
         
         df = df.copy()
         df['rsi'] = calculate_rsi(df['close'], self.rsi_period)
@@ -64,7 +64,7 @@ class FractalMomentumStrategy:
         if self.capital < self.min_trade_rm:
             return (None, None, None, None, {"error": f"Insufficient capital: RM{self.capital:.2f} < RM{self.min_trade_rm:.2f}"})
         
-        volume_ok = volume > vol_sma
+        volume_ok = volume > vol_sma if not pd.isna(vol_sma) else True
         
         four_h_ok = True
         if self.timeframe == "daily":
