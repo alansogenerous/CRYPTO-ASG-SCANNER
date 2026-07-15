@@ -2,16 +2,8 @@
 """
 SOL Enhanced Strategy 5/5 — ATR, Volume, Multi‑TF, Trailing Stop
 ==================================================================
-UPDATED: Uses 1‑hour candles for near‑real‑time price.
-- Entry: RSI crosses ABOVE 30 (oversold bounce) + 200‑SMA uptrend
-- Exit: RSI crosses BELOW 70 (overbought) OR trailing stop / TP
-- SL/TP: ATR‑based (1.5× ATR for SL, 3× ATR for TP)
-- Multi‑timeframe: 1‑hour RSI > 30 for buy confirmation
-- Volume: must exceed 20‑day average (calculated on 1‑hour)
-- Trailing: activates after +4% profit, trails by 1× ATR
-- ALL PRICES IN USD — matches Yahoo Finance live price
-
-Backtest (2025 SOL): +44.4% on $50 | 100% win rate
+UPDATED: Robust column handling for yfinance MultiIndex.
+Uses 1‑hour candles for near‑real‑time price.
 """
 
 import yfinance as yf
@@ -20,14 +12,13 @@ import numpy as np
 import os
 import json
 import time
-import traceback
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 # ============================================================
-# CONFIGURATION (from environment)
+# CONFIGURATION
 # ============================================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -224,55 +215,68 @@ def save_state(state: Dict) -> bool:
         return False
 
 # ============================================================
-# DATA FETCHING (1‑hour interval for live price)
+# DATA FETCHING (1‑hour interval with robust column handling)
 # ============================================================
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Handle MultiIndex columns from yfinance.
+    If columns are tuples, flatten to first level (the actual column name).
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # If MultiIndex, take the first level (e.g., 'Open', 'High', etc.)
+        new_cols = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+        df.columns = new_cols
+    # Now ensure all column names are strings and lowercased
+    df.columns = [str(col).lower().replace(" ", "_") for col in df.columns]
+    return df
+
 def fetch_main_data() -> Optional[pd.DataFrame]:
     """
     Fetch 1‑hour candles for the last 30 days.
-    This gives enough data for 200‑SMA and near‑real‑time price.
     """
     for attempt in range(1, MAX_RETRIES+1):
         try:
             logger.info(f"Fetching 1‑hour data (attempt {attempt})...")
-            # Use download with progress=False to avoid warnings
+            # Use download with progress=False
             df = yf.download(TICKER, period="30d", interval="1h", progress=False, auto_adjust=False)
             if df.empty:
-                # Fallback: use Ticker.history()
+                # Fallback: Ticker.history()
                 ticker = yf.Ticker(TICKER)
                 df = ticker.history(period="30d", interval="1h")
-            if not df.empty and len(df) >= RSI_PERIOD + 5:
-                df = df.reset_index()
-                df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+            if df.empty:
+                logger.warn("Empty DataFrame received.")
+                time.sleep(RETRY_DELAY)
+                continue
+            
+            # Clean columns
+            df = clean_columns(df)
+            
+            # Reset index to have 'date' column
+            df = df.reset_index()
+            # 'date' might be named 'datetime' or 'date' depending on yfinance version
+            if 'datetime' in df.columns:
+                df.rename(columns={'datetime': 'date'}, inplace=True)
+            elif 'date' not in df.columns:
+                # If no date column, use index as date (should be datetime)
+                df['date'] = df.index
+            # Ensure date is datetime
+            df['date'] = pd.to_datetime(df['date'])
+            
+            # Check data quality
+            if len(df) >= RSI_PERIOD + 5:
                 latest = df['close'].iloc[-1]
                 if 1 < latest < 50000:
                     logger.success(f"1‑hour data: {len(df)} rows, latest ${latest:,.2f}")
                     return df
+                else:
+                    logger.warn(f"Price out of expected range: ${latest:.2f}")
+            else:
+                logger.warn(f"Not enough data: {len(df)} rows (need {RSI_PERIOD+5})")
             time.sleep(RETRY_DELAY)
         except Exception as e:
             logger.error(f"yfinance error: {e}")
             time.sleep(RETRY_DELAY)
     return None
-
-def fetch_1h_rsi() -> Optional[Dict]:
-    """Fetch 1‑hour RSI for confirmation (we already have it from main data, but this is separate)."""
-    # We'll use the same data to avoid multiple fetches; but we can just compute from main data.
-    # To keep simplicity, we can reuse the main data if available, but we'll just fetch a shorter period.
-    try:
-        ticker = yf.Ticker(TICKER)
-        df = ticker.history(period="2d", interval="1h")
-        if df.empty or len(df) < 14:
-            return None
-        close = df['Close']
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0).rolling(RSI_PERIOD).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(RSI_PERIOD).mean()
-        rs = gain / loss
-        rsi_1h = 100 - (100 / (1 + rs))
-        latest_rsi = rsi_1h.iloc[-1]
-        prev_rsi = rsi_1h.iloc[-2] if len(rsi_1h) > 1 else latest_rsi
-        return {"rsi": latest_rsi, "prev_rsi": prev_rsi}
-    except:
-        return None
 
 # ============================================================
 # INDICATORS
@@ -292,7 +296,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 # ============================================================
-# SIGNAL GENERATION (ENHANCED 5/5)
+# SIGNAL GENERATION
 # ============================================================
 def check_signals(df: pd.DataFrame, state: Dict) -> Dict:
     df['rsi'] = calculate_rsi(df['close'], RSI_PERIOD)
@@ -319,20 +323,7 @@ def check_signals(df: pd.DataFrame, state: Dict) -> Dict:
     low = curr['low']
 
     volume_ok = volume > vol_sma if not pd.isna(vol_sma) else True
-
-    # 1‑hour RSI confirmation (using separate fetch or we can compute from same df)
-    # We'll compute from df itself (use the same RSI series)
-    rsi_1h = rsi  # since we're on 1‑hour candles, the RSI is already 1‑hour RSI
-    # Actually we want a short‑term RSI, but we can just use the same.
-    # For confirmation, we want the 1‑hour RSI to be > 30 when oversold.
-    one_h_ok = True
-    if rsi < RSI_OVERSOLD:
-        # Check if recent 1‑hour RSI is also > 30 (we can use current rsi itself)
-        # Since we are on 1‑hour, we just ensure rsi > 30 if we are oversold.
-        # But we already have prev_rsi < RSI_OVERSOLD and current_rsi >= RSI_OVERSOLD in BUY condition.
-        one_h_ok = True  # Already handled by the crossover logic.
-    else:
-        one_h_ok = True
+    one_h_ok = True  # already using 1‑hour data, so no separate TF needed
 
     trend = "BULLISH" if price > sma_200 else "BEARISH"
 
@@ -378,7 +369,7 @@ def check_signals(df: pd.DataFrame, state: Dict) -> Dict:
     }
 
 # ============================================================
-# POSITION MANAGEMENT (SL/TP/TRAILING)
+# POSITION MANAGEMENT
 # ============================================================
 def check_exit_conditions(state: Dict, current_price: float, current_high: float, atr: float) -> Tuple[bool, str, float]:
     entry = state.get("entry_price")
