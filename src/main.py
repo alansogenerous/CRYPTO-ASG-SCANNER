@@ -1,4 +1,4 @@
-"""Main entry point — with robust data fallback."""
+"""Main entry point — SOL bot using yfinance only."""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,7 +13,7 @@ import numpy as np
 import yfinance as yf
 import requests
 
-from src.luno_client import LunoClient
+# Removed Luno import — we only use yfinance now
 from src.strategy import FractalMomentumStrategy
 from src.alerts import (
     send_telegram_alert,
@@ -71,142 +71,77 @@ def save_state(state: Dict[str, Any]) -> bool:
         log_message(f"❌ Error saving state: {e}")
         return False
 
+def get_usd_to_myr() -> float:
+    """Get live USD/MYR exchange rate with fallback."""
+    try:
+        resp = requests.get("https://api.exchangerate.host/convert?from=USD&to=MYR&amount=1", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                return float(data["result"])
+    except Exception as e:
+        log_message(f"⚠️ Exchange rate API error: {e}")
+    # Fallback to a reasonable fixed rate
+    return 4.70
+
 def fetch_sol_data(timeframe: str = "daily") -> Optional[pd.DataFrame]:
-    """Fetch SOL/MYR data from multiple sources with robust fallback."""
-    log_message(f"📊 Fetching SOL data ({timeframe})...")
-    client = LunoClient()
-    usd_to_myr = client.get_usd_to_myr()
+    """Fetch SOL-USD data from Yahoo Finance and convert to MYR."""
+    log_message(f"📊 Fetching SOL data from Yahoo Finance ({timeframe})...")
+    
+    usd_to_myr = get_usd_to_myr()
     log_message(f"💱 USD/MYR = {usd_to_myr:.4f}")
     
-    # Try 1: Luno API (may not support SOLMYR, but we try anyway)
-    try:
-        duration = 86400 if timeframe == "daily" else 14400
-        candles = client.get_candles(pair="SOLMYR", duration=duration, limit=500)
-        if candles and len(candles) > 50:
-            df = pd.DataFrame(candles)
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df = df.sort_values('timestamp').reset_index(drop=True)
-            log_message(f"✅ Fetched {len(df)} candles from Luno")
-            return df
-    except Exception as e:
-        log_message(f"⚠️ Luno API error: {e}")
+    interval = "1d" if timeframe == "daily" else "4h"
+    period = "120d" if timeframe == "daily" else "30d"
     
-    # Try 2: Yahoo Finance (SOL-USD) — primary source
-    log_message("⚠️ Falling back to Yahoo Finance...")
+    # Try yfinance download (compatible with various versions)
     try:
-        # Use download with retry and without 'progress' argument
-        interval = "1d" if timeframe == "daily" else "4h"
-        period = "120d" if timeframe == "daily" else "30d"
-        # Add a small delay to avoid rate limits
-        time.sleep(1)
-        df = yf.download(
-            "SOL-USD",
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,   # some versions require this
-            threads=False
-        )
-        # If progress=False causes error, retry without it
+        # First attempt: without progress parameter (older versions)
+        df = yf.download("SOL-USD", period=period, interval=interval, auto_adjust=False)
         if df.empty:
-            df = yf.download("SOL-USD", period=period, interval=interval, auto_adjust=False)
-        
-        if not df.empty and len(df) > 50:
-            df = df.reset_index()
-            # Handle column naming differences
-            df.columns = [c.lower().replace(" ", "_") for c in df.columns]
-            # Convert to MYR
-            df['close'] = df['close'] * usd_to_myr
-            df['open'] = df['open'] * usd_to_myr
-            df['high'] = df['high'] * usd_to_myr
-            df['low'] = df['low'] * usd_to_myr
-            log_message(f"✅ Fetched {len(df)} candles from Yahoo (converted to MYR)")
-            return df
+            raise ValueError("Empty DataFrame")
+        # If it fails, we'll try with progress=False in except
     except Exception as e:
-        log_message(f"❌ Yahoo error: {e}")
-        # If 'progress' error, retry without it
-        if "progress" in str(e):
-            try:
-                df = yf.download("SOL-USD", period=period, interval=interval, auto_adjust=False)
-                if not df.empty and len(df) > 50:
-                    df = df.reset_index()
-                    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
-                    df['close'] = df['close'] * usd_to_myr
-                    df['open'] = df['open'] * usd_to_myr
-                    df['high'] = df['high'] * usd_to_myr
-                    df['low'] = df['low'] * usd_to_myr
-                    log_message(f"✅ Retry without progress: {len(df)} candles from Yahoo")
-                    return df
-            except Exception as e2:
-                log_message(f"❌ Retry also failed: {e2}")
-    
-    # Try 3: Use yf.Ticker().history() as alternative
-    try:
-        ticker = yf.Ticker("SOL-USD")
-        df = ticker.history(period="120d", interval="1d" if timeframe=="daily" else "4h")
-        if not df.empty and len(df) > 50:
-            df = df.reset_index()
-            df.columns = [c.lower().replace(" ", "_") for c in df.columns]
-            df['close'] = df['close'] * usd_to_myr
-            df['open'] = df['open'] * usd_to_myr
-            df['high'] = df['high'] * usd_to_myr
-            df['low'] = df['low'] * usd_to_myr
-            log_message(f"✅ Fetched {len(df)} candles via Ticker.history()")
-            return df
-    except Exception as e:
-        log_message(f"❌ Ticker.history() error: {e}")
-    
-    # Try 4: Generate synthetic data based on current price (for demo/fallback)
-    log_message("⚠️ Generating synthetic data for fallback (using live price)...")
-    try:
-        # Get current SOL price from Luno ticker or Yahoo
-        current_price = None
+        log_message(f"⚠️ yfinance download (no progress) failed: {e}")
+        # Second attempt: with progress=False (newer versions)
         try:
-            ticker_data = client.get_ticker("SOLMYR")
-            current_price = ticker_data.get("price")
-            if not current_price or current_price <= 0:
-                raise ValueError("No price")
-        except:
-            # Fallback: Yahoo Finance latest close
-            ticker = yf.Ticker("SOL-USD")
-            hist = ticker.history(period="1d", interval="1d")
-            if not hist.empty:
-                current_price_usd = hist['Close'].iloc[-1]
-                current_price = current_price_usd * usd_to_myr
-            else:
-                current_price = 20.0 * usd_to_myr  # default ~RM94
-        
-        if current_price is None:
-            current_price = 100.0 * usd_to_myr
-        
-        # Create synthetic daily candles
-        dates = pd.date_range(end=datetime.now(), periods=250, freq='D')
-        np.random.seed(42)
-        returns = np.random.normal(0.0005, 0.02, 250)
-        price_series = current_price * np.exp(np.cumsum(returns))
-        price_series = np.maximum(price_series, current_price * 0.5)
-        price_series = np.minimum(price_series, current_price * 2.0)
-        
-        df = pd.DataFrame({
-            'timestamp': dates,
-            'open': price_series * (1 + np.random.normal(0, 0.005, 250)),
-            'high': price_series * (1 + np.abs(np.random.normal(0.01, 0.01, 250))),
-            'low': price_series * (1 - np.abs(np.random.normal(0.01, 0.01, 250))),
-            'close': price_series,
-            'volume': np.random.uniform(100000, 500000, 250)
-        })
-        df['high'] = df[['high', 'close']].max(axis=1)
-        df['low'] = df[['low', 'close']].min(axis=1)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        log_message(f"✅ Generated {len(df)} synthetic candles (price ~RM {current_price:.2f})")
-        return df
-    except Exception as e:
-        log_message(f"❌ Synthetic data generation failed: {e}")
+            df = yf.download("SOL-USD", period=period, interval=interval, auto_adjust=False, progress=False)
+        except Exception as e2:
+            log_message(f"❌ yfinance download with progress also failed: {e2}")
+            # Third attempt: use Ticker.history()
+            try:
+                ticker = yf.Ticker("SOL-USD")
+                df = ticker.history(period=period, interval=interval)
+            except Exception as e3:
+                log_message(f"❌ Ticker.history() failed: {e3}")
+                return None
+    
+    if df is None or df.empty:
+        log_message("❌ No data returned from Yahoo Finance")
         return None
+    
+    if len(df) < 50:
+        log_message(f"⚠️ Only {len(df)} candles — insufficient for strategy (need 50+)")
+        # Still return but strategy will handle insufficient data
+        # We'll generate synthetic to keep bot alive? No, we'll just return what we have.
+    
+    # Reset index and clean column names
+    df = df.reset_index()
+    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+    
+    # Convert price columns to MYR
+    df['close'] = df['close'] * usd_to_myr
+    df['open'] = df['open'] * usd_to_myr
+    df['high'] = df['high'] * usd_to_myr
+    df['low'] = df['low'] * usd_to_myr
+    # Volume stays as is (in USD units, but we don't convert)
+    
+    log_message(f"✅ Fetched {len(df)} candles from Yahoo (converted to MYR)")
+    return df
 
 def main():
     log_message("=" * 70)
-    log_message("🚀 SOL Fractal Momentum Bot v2.0 — 5/5")
+    log_message("🚀 SOL Fractal Momentum Bot v2.0 — 5/5 (yfinance only)")
     log_message("=" * 70)
     
     state = load_state()
@@ -220,7 +155,7 @@ def main():
         timeframe = os.getenv("TIMEFRAME", "daily")
         df = fetch_sol_data(timeframe)
         if df is None:
-            raise Exception("All data sources failed")
+            raise Exception("Failed to fetch data from Yahoo Finance")
         
         strategy = FractalMomentumStrategy(
             capital=50.0,
@@ -241,6 +176,7 @@ def main():
             strategy.entry_date = state.get("entry_date")
             strategy.highest_price = state.get("highest_price", state["entry_price"])
             strategy.trailing_active = state.get("trailing_active", False)
+            # Recalculate SL/TP based on latest ATR from data
             if 'atr' in df.columns:
                 latest_atr = df['atr'].iloc[-1]
             else:
