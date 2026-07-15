@@ -8,12 +8,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def send_telegram_alert(message: str, parse_mode: str = "Markdown") -> bool:
-    """Send alert via Telegram bot with retry."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram credentials missing. Printing alert to console:")
         print(message)
         return False
-    
     if ":" not in TELEGRAM_BOT_TOKEN:
         print("❌ Invalid Telegram token format")
         return False
@@ -85,32 +83,24 @@ def format_signal_alert(
 
 📊 RSI(14): `{meta.get('rsi', 0):.1f}` | Trend: {meta.get('trend', 'N/A')}
 """
-    
     if meta.get('prev_rsi') is not None:
         message += f"📉 Previous RSI: `{meta['prev_rsi']:.1f}`\n"
-    
     if meta.get('confidence'):
         message += f"💪 Confidence: {meta['confidence']}\n"
-    
     if tp:
         message += f"🎯 Take-Profit: RM {tp:,.2f} (+{((tp/price)-1)*100:.1f}%)\n"
     if sl:
         message += f"🛑 Stop-Loss: RM {sl:,.2f} ({((sl/price)-1)*100:.1f}%)\n"
-    
     if meta.get('atr'):
         message += f"📈 ATR: RM {meta['atr']:.2f} ({meta['atr']/price*100:.2f}%)\n"
-    
     if meta.get('volume_ok') is not None:
         message += f"🔊 Volume: {'✅ Confirmed' if meta['volume_ok'] else '⚠️ Below Avg'}\n"
     if meta.get('four_h_ok') is not None:
         message += f"🕓 4H RSI: {'✅ OK' if meta['four_h_ok'] else '⚠️ Not aligned'}\n"
-    
     if meta.get('sma_200'):
         message += f"📊 200-SMA: RM {meta['sma_200']:,.2f}\n"
-    
     if meta.get('high') and meta.get('low'):
         message += f"📊 Range: RM {meta['low']:,.2f} - RM {meta['high']:,.2f}\n"
-    
     message += "\n#SOL #Luno #TradingSignal"
     return message
 
@@ -118,7 +108,6 @@ def format_heartbeat(price: float, meta: Dict, state: Dict) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M MYT")
     last_signal = state.get('last_signal', 'None')
     last_date = state.get('last_signal_date', '-')
-    
     message = f"""
 💓 *SOL/MYR | No Signal | RM {price:,.2f}*
 📅 {timestamp}
@@ -145,8 +134,7 @@ def send_startup_notification():
 💱 Live USD/MYR conversion
 
 📈 Backtest (2025): +44.4% on RM50 | 100% win rate
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M MYT')}
-"""
+⏰ """ + datetime.now().strftime('%Y-%m-%d %H:%M MYT')
     send_telegram_alert(message)
 
 def send_health_report(state: Dict):
@@ -160,7 +148,6 @@ def send_health_report(state: Dict):
             pnl = ((h['price'] - entry['price']) / entry['price']) * 100
             trades.append(pnl)
             entry = None
-    
     stats = ""
     if trades:
         wins = sum(1 for t in trades if t > 0)
@@ -175,7 +162,6 @@ def send_health_report(state: Dict):
    Total Trades: {len(trades)}"""
     else:
         stats = "\n📈 No completed trades yet."
-    
     message = f"""
 🏥 *Health Report*
 
