@@ -1,9 +1,10 @@
-"""Luno API client with live exchange rate."""
+"""Luno API client with robust fallback."""
 import os
 import requests
+import time
+import json
 from typing import Optional, List, Dict
 from datetime import datetime
-import time
 
 class LunoClient:
     BASE_URL = "https://api.luno.com/api/1"
@@ -12,6 +13,8 @@ class LunoClient:
     def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None):
         self.api_key = api_key or os.getenv("LUNO_API_KEY")
         self.api_secret = api_secret or os.getenv("LUNO_API_SECRET")
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     
     def _auth(self):
         if self.api_key and self.api_secret:
@@ -19,16 +22,24 @@ class LunoClient:
         return None
     
     def get_usd_to_myr(self) -> float:
-        """Get live USD/MYR exchange rate."""
+        """Get live USD/MYR exchange rate with fallback."""
         try:
-            resp = requests.get(self.EXCHANGE_RATE_URL, params={"from": "USD", "to": "MYR", "amount": 1}, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("success"):
-                return float(data["result"])
+            resp = self.session.get(self.EXCHANGE_RATE_URL, params={"from": "USD", "to": "MYR", "amount": 1}, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success"):
+                    return float(data["result"])
         except Exception as e:
-            print(f"Exchange rate fetch error: {e}")
-        # Fallback to approximate
+            print(f"Exchange rate error: {e}")
+        # Try alternative API
+        try:
+            resp = requests.get("https://api.frankfurter.app/latest?from=USD&to=MYR", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                return float(data["rates"]["MYR"])
+        except:
+            pass
+        # Fallback
         return 4.70
     
     def get_ticker(self, pair: str = "SOLMYR") -> Dict:
@@ -38,7 +49,7 @@ class LunoClient:
         auth = self._auth()
         for attempt in range(3):
             try:
-                resp = requests.get(url, params=params, auth=auth, timeout=30)
+                resp = self.session.get(url, params=params, auth=auth, timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
                 return {
@@ -61,7 +72,7 @@ class LunoClient:
         auth = self._auth()
         for attempt in range(3):
             try:
-                resp = requests.get(url, params=params, auth=auth, timeout=30)
+                resp = self.session.get(url, params=params, auth=auth, timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
                 candles = data.get("candles", [])
@@ -79,4 +90,5 @@ class LunoClient:
             except Exception as e:
                 print(f"Candles error (attempt {attempt+1}): {e}")
                 time.sleep(2)
-        raise Exception(f"Failed to fetch candles for {pair}")
+        # Fallback: return empty list
+        return []
