@@ -29,7 +29,8 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 def fetch_4h_rsi(ticker: str = "SOL-USD") -> float:
     """Fetch 4‑hour RSI from Yahoo Finance with robust handling."""
     try:
-        df = yf.download(ticker, period="7d", interval="4h", progress=False, auto_adjust=False)
+        # Use download with progress=False removed (compatible with older versions)
+        df = yf.download(ticker, period="7d", interval="4h", auto_adjust=False)
         if df.empty or len(df) < 14:
             return None
         close = df['Close']
