@@ -1,6 +1,11 @@
-"""Main entry point — now 5/5."""
-import os
+"""Main entry point — now 5/5 with sys.path fix."""
 import sys
+import os
+
+# Add project root to sys.path so that 'src' becomes importable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Now imports work correctly
 import json
 import time
 from datetime import datetime
@@ -8,9 +13,9 @@ from typing import Dict, Any
 
 import pandas as pd
 
-from src.luno_client import LunoClient          # <-- absolute import
-from src.strategy import FractalMomentumStrategy  # <-- absolute import
-from src.alerts import (                         # <-- absolute import
+from src.luno_client import LunoClient
+from src.strategy import FractalMomentumStrategy
+from src.alerts import (
     send_telegram_alert,
     format_signal_alert,
     format_heartbeat,
