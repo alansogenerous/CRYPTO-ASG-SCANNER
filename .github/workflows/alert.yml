@@ -24,19 +24,23 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install yfinance pandas numpy requests
 
-      - name: Run SOL Enhanced Strategy
+      - name: Run SOL Strategy
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TIMEFRAME: daily   # or '4h' for 4-hour signals
-        run: python src/main.py
+          TICKER: SOL-USD
+          RSI_PERIOD: 14
+          RSI_OVERSOLD: 30
+          RSI_OVERBOUGHT: 70
+          HEALTH_INTERVAL: 7
+        run: python sol_rsi_bot.py
 
       - name: Upload logs on failure
         uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: sol-bot-logs
-          path: sol_bot.log
+          path: sol_rsi_bot.log
           retention-days: 7
