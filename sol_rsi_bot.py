@@ -9,9 +9,9 @@ Strategy: Trend‑following with mean‑reversion entry
 - Multi‑timeframe: 1‑hour RSI > 30 for buy confirmation
 - Volume: must exceed 20‑day average
 - Trailing: activates after +4% profit, trails by 1× ATR
-- Live USD/MYR conversion for RM alerts
+- ALL PRICES IN USD (no MYR conversion)
 
-Backtest (2025 SOL): +44.4% on RM50 | 100% win rate
+Backtest (2025 SOL): +44.4% on $50 | 100% win rate
 """
 
 import yfinance as yf
@@ -31,7 +31,7 @@ import requests
 # ============================================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-TICKER = os.environ.get("TICKER", "SOL-USD")          # <-- SOL
+TICKER = os.environ.get("TICKER", "SOL-USD")          # <-- SOL in USD
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
 RSI_OVERSOLD = float(os.environ.get("RSI_OVERSOLD", "30"))
 RSI_OVERBOUGHT = float(os.environ.get("RSI_OVERBOUGHT", "70"))
@@ -111,19 +111,19 @@ def send_telegram_message(message: str, parse_mode: str = "Markdown") -> bool:
 def send_startup_notification():
     msg = (
         f"🚀 *SOL Enhanced Strategy 5/5 Started*\n\n"
-        f"📊 Asset: {TICKER}\n"
+        f"📊 Asset: {TICKER} (USD)\n"
         f"🎯 RSI({RSI_PERIOD}) cross above {RSI_OVERSOLD:.0f} (BUY)\n"
         f"🎯 RSI cross below {RSI_OVERBOUGHT:.0f} (SELL)\n"
         f"🔧 SL: {ATR_MULT_SL}×ATR | TP: {ATR_MULT_TP}×ATR\n"
         f"📈 Trailing: +{TRAIL_ACTIVATE_PCT}% trigger, {TRAIL_STEP_ATR}×ATR trail\n"
         f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        f"📊 Backtest 2025: +44.4% on RM50 | 100% win rate"
+        f"📊 Backtest 2025: +44.4% on $50 | 100% win rate"
     )
     send_telegram_message(msg)
 
 def send_heartbeat(result: Dict, state: Dict):
     msg = (
-        f"💓 *{TICKER} | No Signal | RM {result['price']:,.2f}*\n\n"
+        f"💓 *{TICKER} | No Signal | ${result['price']:,.2f}*\n\n"
         f"📊 RSI: `{result['rsi']:.1f}` | {result['trend']}\n"
         f"📡 Last Signal: {state.get('last_signal', 'None')}\n"
         f"✅ Bot alive. Monitoring..."
@@ -141,13 +141,13 @@ def send_signal_alert(result: Dict, state: Dict):
         pnl_line = f"📊 P&L: {pnl:+.2f}%"
 
     msg = (
-        f"{emoji} *{TICKER} | {action} | RM {result['price']:,.2f}*\n\n"
+        f"{emoji} *{TICKER} | {action} | ${result['price']:,.2f}*\n\n"
         f"📊 RSI({RSI_PERIOD}): `{result['rsi']:.1f}` (prev: {result['prev_rsi']:.1f})\n"
         f"📅 {result['date'][:10]} | {result['trend']}\n"
         f"💪 Confidence: {result['confidence'].upper()}\n"
         f"{pnl_line}\n\n"
-        f"📍 Support: RM {result['support']:,.0f} | Resistance: RM {result['resistance']:,.0f}\n"
-        f"📈 ATR: RM {result['atr']:.2f} ({result['atr_ratio']*100:.2f}%)\n"
+        f"📍 Support: ${result['support']:,.0f} | Resistance: ${result['resistance']:,.0f}\n"
+        f"📈 ATR: ${result['atr']:.2f} ({result['atr_ratio']*100:.2f}%)\n"
         f"🔍 Volume OK: {'✅' if result['volume_ok'] else '⚠️'} | 1H OK: {'✅' if result['one_h_ok'] else '⚠️'}\n\n"
         f"{'🚀 ENTER NOW!' if signal == 'BUY' else '🔒 EXIT NOW!'}"
     )
@@ -177,7 +177,7 @@ def send_health_report(state: Dict):
         f"🏥 *Health Report*\n"
         f"🔢 Runs: {state.get('run_count',0)}\n"
         f"📡 Last Signal: {state.get('last_signal','None')}\n"
-        f"💰 Last Price: RM {state.get('last_price','N/A')}\n"
+        f"💰 Last Price: ${state.get('last_price','N/A')}\n"
         f"❌ Errors: {state.get('error_count',0)}\n"
         f"{stats}\n\n"
         f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
@@ -224,25 +224,9 @@ def save_state(state: Dict) -> bool:
         return False
 
 # ============================================================
-# USD -> MYR CONVERSION
-# ============================================================
-def get_usd_to_myr() -> float:
-    try:
-        resp = requests.get("https://api.exchangerate.host/convert?from=USD&to=MYR&amount=1", timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("success"):
-                return float(data["result"])
-    except:
-        pass
-    # Fallback
-    return 4.70
-
-# ============================================================
-# DATA FETCHING (daily and 1‑hour)
+# DATA FETCHING (daily and 1‑hour) — USD ONLY
 # ============================================================
 def fetch_daily_data() -> Optional[pd.DataFrame]:
-    usd_to_myr = get_usd_to_myr()
     for attempt in range(1, MAX_RETRIES+1):
         try:
             logger.info(f"Fetching daily data (attempt {attempt})...")
@@ -251,14 +235,9 @@ def fetch_daily_data() -> Optional[pd.DataFrame]:
             if not df.empty and len(df) >= RSI_PERIOD + 5:
                 df = df.reset_index()
                 df.columns = [c.lower().replace(" ", "_") for c in df.columns]
-                # Convert to MYR
-                df['close'] = df['close'] * usd_to_myr
-                df['open'] = df['open'] * usd_to_myr
-                df['high'] = df['high'] * usd_to_myr
-                df['low'] = df['low'] * usd_to_myr
                 latest = df['close'].iloc[-1]
-                if 10 < latest < 50000:
-                    logger.success(f"Daily data: {len(df)} rows, latest RM {latest:,.2f}")
+                if 1 < latest < 50000:
+                    logger.success(f"Daily data: {len(df)} rows, latest ${latest:,.2f}")
                     return df
             time.sleep(RETRY_DELAY)
         except Exception as e:
@@ -305,7 +284,6 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # SIGNAL GENERATION (ENHANCED 5/5)
 # ============================================================
 def check_signals(df: pd.DataFrame, state: Dict) -> Dict:
-    # Compute indicators
     df['rsi'] = calculate_rsi(df['close'], RSI_PERIOD)
     df['atr'] = calculate_atr(df, 14)
     df['volume_sma'] = df['volume'].rolling(VOLUME_MA_PERIOD).mean()
@@ -412,7 +390,7 @@ def check_exit_conditions(state: Dict, current_price: float, current_high: float
 # ============================================================
 def main():
     logger.info("="*70)
-    logger.info("🚀 SOL Enhanced Strategy 5/5 — Start")
+    logger.info("🚀 SOL Enhanced Strategy 5/5 — Start (USD)")
     logger.info("="*70)
 
     state = load_state()
@@ -431,7 +409,7 @@ def main():
     signal = result["signal"]
 
     logger.info(f"Signal: {signal if signal else 'NONE'}")
-    logger.info(f"RSI: {result['rsi']:.1f} | Price: RM {result['price']:.2f}")
+    logger.info(f"RSI: {result['rsi']:.1f} | Price: ${result['price']:.2f}")
 
     exit_trigger = False
     exit_reason = ""
@@ -443,13 +421,13 @@ def main():
         )
 
     if exit_trigger:
-        logger.info(f"🚨 EXIT: {exit_reason} at RM {exit_price:.2f}")
+        logger.info(f"🚨 EXIT: {exit_reason} at ${exit_price:.2f}")
         pnl = ((exit_price - state["entry_price"]) / state["entry_price"]) * 100
         msg = (
             f"🚨 *EXIT ALERT*\n\n"
             f"Reason: {exit_reason}\n"
-            f"Price: RM {exit_price:,.2f}\n"
-            f"Entry: RM {state['entry_price']:,.2f}\n"
+            f"Price: ${exit_price:,.2f}\n"
+            f"Entry: ${state['entry_price']:,.2f}\n"
             f"P&L: {pnl:+.2f}%\n"
             f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
         )
@@ -472,14 +450,14 @@ def main():
         state["last_signal"] = "BUY"
         state["signal_history"].append({"signal":"BUY", "price":result["price"], "date":result["date"]})
         send_signal_alert(result, state)
-        logger.info(f"🟢 BUY signal sent at RM {result['price']:.2f}")
+        logger.info(f"🟢 BUY signal sent at ${result['price']:.2f}")
         save_state(state)
     elif signal == "SELL" and state.get("entry_price") is not None:
         pnl = ((result["price"] - state["entry_price"]) / state["entry_price"]) * 100
         msg = (
             f"🔴 *SELL SIGNAL*\n\n"
-            f"Price: RM {result['price']:,.2f}\n"
-            f"Entry: RM {state['entry_price']:,.2f}\n"
+            f"Price: ${result['price']:,.2f}\n"
+            f"Entry: ${state['entry_price']:,.2f}\n"
             f"P&L: {pnl:+.2f}%\n"
             f"RSI: {result['rsi']:.1f}"
         )
@@ -490,7 +468,7 @@ def main():
         state["trailing_active"] = False
         state["last_signal"] = "SELL"
         save_state(state)
-        logger.info(f"🔴 SELL signal sent at RM {result['price']:.2f}")
+        logger.info(f"🔴 SELL signal sent at ${result['price']:.2f}")
     else:
         if not exit_trigger:
             logger.info("💓 No signal – sending heartbeat")
