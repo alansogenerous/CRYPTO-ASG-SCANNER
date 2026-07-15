@@ -2,7 +2,7 @@
 import pandas as pd
 import numpy as np
 from typing import Optional, Tuple, Dict
-from .indicators import calculate_rsi, calculate_sma, calculate_atr, fetch_4h_rsi
+from src.indicators import calculate_rsi, calculate_sma, calculate_atr, fetch_4h_rsi   # <-- absolute import
 
 class FractalMomentumStrategy:
     def __init__(
@@ -16,7 +16,7 @@ class FractalMomentumStrategy:
         trail_trigger_pct: float = 4.0,
         trail_step_atr: float = 1.0,
         volume_ma_period: int = 20,
-        timeframe: str = "daily",  # "daily" or "4h"
+        timeframe: str = "daily",
         min_trade_rm: float = 5.0
     ):
         self.capital = capital
@@ -43,14 +43,12 @@ class FractalMomentumStrategy:
         if len(df) < 200:
             return (None, None, None, None, {"error": "Insufficient data"})
         
-        # Calculate indicators
         df = df.copy()
         df['rsi'] = calculate_rsi(df['close'], self.rsi_period)
         df['sma_200'] = calculate_sma(df['close'], 200)
         df['atr'] = calculate_atr(df, 14)
         df['volume_sma'] = df['volume'].rolling(self.volume_ma_period).mean()
         
-        # Use confirmed candle (yesterday for daily, previous for 4h)
         idx = -2 if len(df) >= 2 else -1
         curr = df.iloc[idx]
         prev = df.iloc[idx-1] if idx-1 >= 0 else curr
@@ -63,37 +61,29 @@ class FractalMomentumStrategy:
         vol_sma = curr['volume_sma']
         sma_200 = curr['sma_200']
         
-        # Check if balance meets minimum trade
         if self.capital < self.min_trade_rm:
             return (None, None, None, None, {"error": f"Insufficient capital: RM{self.capital:.2f} < RM{self.min_trade_rm:.2f}"})
         
-        # Volume confirmation
         volume_ok = volume > vol_sma
         
-        # 4H RSI confirmation (only for daily timeframe)
         four_h_ok = True
         if self.timeframe == "daily":
             rsi_4h = fetch_4h_rsi()
             if rsi_4h is not None:
-                # BUY: 4H RSI > 30 and rising (simplified: 4H RSI > 30)
-                if current_rsi < self.rsi_oversold:  # we are checking oversold
+                if current_rsi < self.rsi_oversold:
                     four_h_ok = rsi_4h > self.rsi_oversold
                 else:
                     four_h_ok = True
         
         trend = "BULLISH" if current_price > sma_200 else "BEARISH"
         
-        # Check exit conditions first
         if self.position_open:
-            # Take Profit
             if current_price >= self.take_profit:
                 self.position_open = False
                 return ("TAKE_PROFIT", current_price, None, None, {"rsi": current_rsi, "trend": trend, "atr": current_atr})
-            # Stop Loss
             if current_price <= self.stop_loss:
                 self.position_open = False
                 return ("STOP_LOSS", current_price, None, None, {"rsi": current_rsi, "trend": trend, "atr": current_atr})
-            # Trailing
             if current_price >= self.entry_price * (1 + self.trail_trigger_pct / 100):
                 self.trailing_active = True
             if self.trailing_active:
@@ -103,17 +93,14 @@ class FractalMomentumStrategy:
                 if current_price <= trail_level:
                     self.position_open = False
                     return ("TRAILING_EXIT", current_price, None, None, {"rsi": current_rsi, "trend": trend, "atr": current_atr})
-            # RSI overbought exit
             if prev_rsi > self.rsi_overbought and current_rsi <= self.rsi_overbought:
                 self.position_open = False
                 return ("SELL", current_price, None, None, {"rsi": current_rsi, "trend": trend, "atr": current_atr})
-            # Trend breakdown
             if current_price < sma_200:
                 self.position_open = False
                 return ("SELL", current_price, None, None, {"rsi": current_rsi, "trend": trend, "atr": current_atr})
             return (None, None, None, None, {"rsi": current_rsi, "trend": trend, "atr": current_atr, "position": "open"})
         
-        # BUY signal
         buy_signal = (
             prev_rsi < self.rsi_oversold and
             current_rsi >= self.rsi_oversold and
