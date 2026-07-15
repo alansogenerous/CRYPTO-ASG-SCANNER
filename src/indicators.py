@@ -27,10 +27,17 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 def fetch_4h_rsi(ticker: str = "SOL-USD") -> float:
-    """Fetch 4‑hour RSI from Yahoo Finance with robust handling."""
+    """Fetch 4‑hour RSI from Yahoo Finance using yfinance only."""
     try:
-        # Use download with progress=False removed (compatible with older versions)
-        df = yf.download(ticker, period="7d", interval="4h", auto_adjust=False)
+        # Try download with auto_adjust=False and progress=False (if supported)
+        df = yf.download(ticker, period="7d", interval="4h", auto_adjust=False, progress=False)
+        if df.empty or len(df) < 14:
+            # If progress=False fails, try without it (some versions)
+            df = yf.download(ticker, period="7d", interval="4h", auto_adjust=False)
+        if df.empty:
+            # Last fallback: Ticker.history()
+            ticker_obj = yf.Ticker(ticker)
+            df = ticker_obj.history(period="7d", interval="4h")
         if df.empty or len(df) < 14:
             return None
         close = df['Close']
