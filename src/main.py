@@ -1,4 +1,4 @@
-"""Main entry point — now with robust data fallback."""
+"""Main entry point — with robust data fallback."""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
 
 from src.luno_client import LunoClient
 from src.strategy import FractalMomentumStrategy
@@ -71,13 +72,13 @@ def save_state(state: Dict[str, Any]) -> bool:
         return False
 
 def fetch_sol_data(timeframe: str = "daily") -> Optional[pd.DataFrame]:
-    """Fetch SOL/MYR data from multiple sources with fallback."""
+    """Fetch SOL/MYR data from multiple sources with robust fallback."""
     log_message(f"📊 Fetching SOL data ({timeframe})...")
     client = LunoClient()
     usd_to_myr = client.get_usd_to_myr()
     log_message(f"💱 USD/MYR = {usd_to_myr:.4f}")
     
-    # Try 1: Luno API
+    # Try 1: Luno API (may not support SOLMYR, but we try anyway)
     try:
         duration = 86400 if timeframe == "daily" else 14400
         candles = client.get_candles(pair="SOLMYR", duration=duration, limit=500)
@@ -90,56 +91,99 @@ def fetch_sol_data(timeframe: str = "daily") -> Optional[pd.DataFrame]:
     except Exception as e:
         log_message(f"⚠️ Luno API error: {e}")
     
-    # Try 2: Yahoo Finance (SOL-USD + conversion)
+    # Try 2: Yahoo Finance (SOL-USD) — primary source
     log_message("⚠️ Falling back to Yahoo Finance...")
     try:
-        ticker = yf.Ticker("SOL-USD")
+        # Use download with retry and without 'progress' argument
         interval = "1d" if timeframe == "daily" else "4h"
         period = "120d" if timeframe == "daily" else "30d"
-        df = ticker.history(period=period, interval=interval, progress=False, auto_adjust=False)
+        # Add a small delay to avoid rate limits
+        time.sleep(1)
+        df = yf.download(
+            "SOL-USD",
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,   # some versions require this
+            threads=False
+        )
+        # If progress=False causes error, retry without it
+        if df.empty:
+            df = yf.download("SOL-USD", period=period, interval=interval, auto_adjust=False)
+        
         if not df.empty and len(df) > 50:
             df = df.reset_index()
+            # Handle column naming differences
             df.columns = [c.lower().replace(" ", "_") for c in df.columns]
             # Convert to MYR
             df['close'] = df['close'] * usd_to_myr
             df['open'] = df['open'] * usd_to_myr
             df['high'] = df['high'] * usd_to_myr
             df['low'] = df['low'] * usd_to_myr
-            # Volume remains in USD terms (not converted)
             log_message(f"✅ Fetched {len(df)} candles from Yahoo (converted to MYR)")
             return df
     except Exception as e:
         log_message(f"❌ Yahoo error: {e}")
+        # If 'progress' error, retry without it
+        if "progress" in str(e):
+            try:
+                df = yf.download("SOL-USD", period=period, interval=interval, auto_adjust=False)
+                if not df.empty and len(df) > 50:
+                    df = df.reset_index()
+                    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+                    df['close'] = df['close'] * usd_to_myr
+                    df['open'] = df['open'] * usd_to_myr
+                    df['high'] = df['high'] * usd_to_myr
+                    df['low'] = df['low'] * usd_to_myr
+                    log_message(f"✅ Retry without progress: {len(df)} candles from Yahoo")
+                    return df
+            except Exception as e2:
+                log_message(f"❌ Retry also failed: {e2}")
     
-    # Try 3: Generate synthetic data based on current price (for demo/fallback)
+    # Try 3: Use yf.Ticker().history() as alternative
+    try:
+        ticker = yf.Ticker("SOL-USD")
+        df = ticker.history(period="120d", interval="1d" if timeframe=="daily" else "4h")
+        if not df.empty and len(df) > 50:
+            df = df.reset_index()
+            df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+            df['close'] = df['close'] * usd_to_myr
+            df['open'] = df['open'] * usd_to_myr
+            df['high'] = df['high'] * usd_to_myr
+            df['low'] = df['low'] * usd_to_myr
+            log_message(f"✅ Fetched {len(df)} candles via Ticker.history()")
+            return df
+    except Exception as e:
+        log_message(f"❌ Ticker.history() error: {e}")
+    
+    # Try 4: Generate synthetic data based on current price (for demo/fallback)
     log_message("⚠️ Generating synthetic data for fallback (using live price)...")
     try:
         # Get current SOL price from Luno ticker or Yahoo
-        current_price_usd = None
+        current_price = None
         try:
             ticker_data = client.get_ticker("SOLMYR")
-            current_price_myr = ticker_data.get("price")
-            if current_price_myr and current_price_myr > 0:
-                current_price = current_price_myr
-            else:
+            current_price = ticker_data.get("price")
+            if not current_price or current_price <= 0:
                 raise ValueError("No price")
         except:
             # Fallback: Yahoo Finance latest close
             ticker = yf.Ticker("SOL-USD")
-            hist = ticker.history(period="1d", interval="1d", progress=False)
+            hist = ticker.history(period="1d", interval="1d")
             if not hist.empty:
                 current_price_usd = hist['Close'].iloc[-1]
                 current_price = current_price_usd * usd_to_myr
             else:
                 current_price = 20.0 * usd_to_myr  # default ~RM94
         
+        if current_price is None:
+            current_price = 100.0 * usd_to_myr
+        
         # Create synthetic daily candles
         dates = pd.date_range(end=datetime.now(), periods=250, freq='D')
-        # Simulate price with some randomness and trend
         np.random.seed(42)
-        returns = np.random.normal(0.0005, 0.02, 250)  # daily return ~0.05%
+        returns = np.random.normal(0.0005, 0.02, 250)
         price_series = current_price * np.exp(np.cumsum(returns))
-        # Ensure reasonable range
         price_series = np.maximum(price_series, current_price * 0.5)
         price_series = np.minimum(price_series, current_price * 2.0)
         
@@ -197,7 +241,6 @@ def main():
             strategy.entry_date = state.get("entry_date")
             strategy.highest_price = state.get("highest_price", state["entry_price"])
             strategy.trailing_active = state.get("trailing_active", False)
-            # Recalculate SL/TP based on latest ATR from data
             if 'atr' in df.columns:
                 latest_atr = df['atr'].iloc[-1]
             else:
