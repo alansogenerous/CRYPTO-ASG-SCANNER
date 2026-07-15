@@ -8,9 +8,9 @@ from typing import Dict, Any
 
 import pandas as pd
 
-from luno_client import LunoClient
-from strategy import FractalMomentumStrategy
-from alerts import (
+from src.luno_client import LunoClient          # <-- absolute import
+from src.strategy import FractalMomentumStrategy  # <-- absolute import
+from src.alerts import (                         # <-- absolute import
     send_telegram_alert,
     format_signal_alert,
     format_heartbeat,
@@ -67,15 +67,12 @@ def save_state(state: Dict[str, Any]) -> bool:
         return False
 
 def fetch_sol_data(timeframe: str = "daily") -> pd.DataFrame:
-    """Fetch SOL/MYR data with live exchange rate."""
     log_message(f"📊 Fetching SOL data ({timeframe})...")
     client = LunoClient()
     
-    # Get live exchange rate
     usd_to_myr = client.get_usd_to_myr()
     log_message(f"💱 USD/MYR = {usd_to_myr:.4f}")
     
-    # Try Luno first
     try:
         duration = 86400 if timeframe == "daily" else 14400
         candles = client.get_candles(pair="SOLMYR", duration=duration, limit=500)
@@ -88,7 +85,6 @@ def fetch_sol_data(timeframe: str = "daily") -> pd.DataFrame:
     except Exception as e:
         log_message(f"⚠️ Luno API error: {e}")
     
-    # Fallback: Yahoo Finance with live rate
     log_message("⚠️ Falling back to Yahoo Finance...")
     try:
         import yfinance as yf
@@ -123,15 +119,12 @@ def main():
         send_startup_notification()
     
     try:
-        # Timeframe from env: "daily" or "4h"
         timeframe = os.getenv("TIMEFRAME", "daily")
         df = fetch_sol_data(timeframe)
         
-        # Get live exchange rate for balance tracking
         client = LunoClient()
         usd_to_myr = client.get_usd_to_myr()
         
-        # Initialize strategy
         strategy = FractalMomentumStrategy(
             capital=50.0,
             rsi_period=14,
@@ -145,14 +138,12 @@ def main():
             min_trade_rm=5.0
         )
         
-        # Restore position
         if state.get("entry_price") is not None:
             strategy.position_open = True
             strategy.entry_price = state["entry_price"]
             strategy.entry_date = state.get("entry_date")
             strategy.highest_price = state.get("highest_price", state["entry_price"])
             strategy.trailing_active = state.get("trailing_active", False)
-            # Recalc SL/TP from latest ATR
             latest_atr = df['atr'].iloc[-1] if 'atr' in df.columns else df['close'].pct_change().std() * df['close'].iloc[-1]
             strategy.stop_loss = strategy.entry_price - (1.5 * latest_atr)
             strategy.take_profit = strategy.entry_price + (3.0 * latest_atr)
